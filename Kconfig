@@ -5,7 +5,7 @@
 
 config DRONECAN
 	bool "DroneCAN support"
-	depends on CAN
+	depends on CAN && DT_HAS_ZEPHYR_DRONECAN_ENABLED
 	help
 	 Enables the DroneCAN (libcanard) support.
 
@@ -71,15 +71,16 @@ config DRONECAN_THREAD_PRIORITY
 	int "Thread priority"
 	default 10 #TBD
 
+config DRONECAN_INIT_PRIORITY
+	int "Init priority"
+	default 90
+	help
+	  Device init priority. Must be higher than CAN_INIT_PRIORITY (80 by default)
+	  so the CAN controller is ready first.
+
 config DRONECAN_RX_MSGQ_SIZE
 	int "RX frame queue depth"
 	default 32
-
-config DRONECAN_MEM_BLOCKS
-	int "libcanard memory pool blocks"
-	default 64
-	help
-	  Pool is __aligned(8); unaligned arenas fault on Cortex-M7
 
 config DRONECAN_TX_TIMEOUT_MS
 	int "CAN send timeout (ms)"

@@ -12,11 +12,7 @@
 
 LOG_MODULE_REGISTER(dronecan_sample, LOG_LEVEL_INF);
 
-BUILD_ASSERT(DT_NODE_HAS_STATUS(DT_NODELABEL(dronecan0), okay),
-	     "dronecan0 node missing or disabled");
-
-/* Stand-in handle until Step 2 defines the dronecan device. */
-static const struct device *const dc = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus));
+static const struct device *const dc = DEVICE_DT_GET(DT_NODELABEL(dronecan0));
 
 static struct dronecan_subscription node_status_sub;
 
@@ -40,14 +36,21 @@ int main(void)
 
 	LOG_INF("dronecan sample");
 
+	if (!device_is_ready(dc)) {
+		LOG_ERR("%s is not ready", dc->name);
+		return -ENODEV;
+	}
+
 	ret = dronecan_start(dc);
 	LOG_INF("dronecan_start: %d", ret);
 
 	ret = dronecan_subscribe(dc, &node_status_sub, &node_status, on_node_status, NULL);
 	LOG_INF("dronecan_subscribe: %d", ret);
 
+	LOG_INF("set_health(OK): %d, set_mode(99): %d", dronecan_set_health(dc, DRONECAN_HEALTH_OK),
+		dronecan_set_mode(dc, 99));
+
 	while (1) {
-		dronecan_set_health(dc, DRONECAN_HEALTH_OK);
 		LOG_INF("node id: %u", dronecan_get_node_id(dc));
 		k_sleep(K_SECONDS(1));
 	}
