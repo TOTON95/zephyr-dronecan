@@ -13,13 +13,28 @@ if(CONFIG_DRONECAN)
   endif()
 
   # DSDL + Generator (as west projects, not Zephyr modules)
-  # It can be overridden with -DDRONECAN_DSDL_DIR=... and -DDRONECAN_DSDLC_DIR=...
-  set(DRONECAN_DSDL_DIR  ${WEST_TOPDIR}/lib/DSDL            CACHE PATH "DroneCAN DSDL definitions")
-  set(DRONECAN_DSDLC_DIR ${WEST_TOPDIR}/lib/dronecan_dsdlc  CACHE PATH "dronecan_dsdlc generator")
+  # They are looked for in <workspace>/lib: first in the workspace of the Zephyr tree being built,
+  # then in the workspace of the application. Applications outside the workspace work in the
+  # first case. It can be overridden with -DDRONECAN_DSDL_DIR=... and -DDRONECAN_DSDLC_DIR=...
+  set(_dsdl_lib_candidates ${ZEPHYR_BASE}/../lib)
+  if(WEST_TOPDIR)
+    list(APPEND _dsdl_lib_candidates ${WEST_TOPDIR}/lib)
+  endif()
+
+  set(_dsdl_lib ${ZEPHYR_BASE}/../lib) # used in the error below when nothing matches
+  foreach(_c ${_dsdl_lib_candidates})
+    if(IS_DIRECTORY ${_c}/DSDL AND IS_DIRECTORY ${_c}/dronecan_dsdlc)
+      set(_dsdl_lib ${_c})
+      break()
+    endif()
+  endforeach()
+
+  set(DRONECAN_DSDL_DIR  ${_dsdl_lib}/DSDL            CACHE PATH "DroneCAN DSDL definitions")
+  set(DRONECAN_DSDLC_DIR ${_dsdl_lib}/dronecan_dsdlc  CACHE PATH "dronecan_dsdlc generator")
 
   foreach(_d ${DRONECAN_DSDL_DIR} ${DRONECAN_DSDLC_DIR})
     if(NOT IS_DIRECTORY ${_d})
-      message(FATAL_ERROR "${_d} not found. Add the DSDL and dronecan_dsdlc west projects to your manifest and run 'west update'.")
+      message(FATAL_ERROR "${_d} not found. Looked for DSDL and dronecan_dsdlc in: ${_dsdl_lib_candidates}. Add the DSDL and dronecan_dsdlc west projects to your manifest and run 'west update', or pass -DDRONECAN_DSDL_DIR=... and -DDRONECAN_DSDLC_DIR=...")
     endif()
   endforeach()
 
