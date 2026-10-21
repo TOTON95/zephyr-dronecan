@@ -39,8 +39,20 @@ static void show_stats(const char *when)
 	struct dronecan_stats s;
 
 	dronecan_get_stats(dc, &s);
-	LOG_INF("%s: tx=%u tx_err=%u pool %u/%u (peak %u)", when, s.tx, s.tx_err, s.mem_current,
-		s.mem_capacity, s.mem_peak);
+	LOG_INF("%s: tx=%u tx_err=%u pool %u/%u (peak %u), IDs granted %u (last %u)", when, s.tx,
+		s.tx_err, s.mem_current, s.mem_capacity, s.mem_peak, s.alloc_grant, s.last_grant_id);
+}
+
+static void show_nodes(void)
+{
+	struct dronecan_node_entry e;
+
+	for (int id = 1; id < 128; id++) {
+		if (dronecan_get_node(dc, id, &e) == 0 && e.active) {
+			LOG_INF("node %d: up %u s, health %u, mode %u, vendor 0x%04x", id, e.uptime_sec,
+				e.health, e.mode, e.vendor_status);
+		}
+	}
 }
 
 int main(void)
@@ -92,6 +104,7 @@ int main(void)
 	// NodeStatus keeps going out once a second: tx should grow by one each time.
 	while (1) {
 		show_stats("running");
+		show_nodes();
 		k_sleep(K_SECONDS(2));
 	}
 
