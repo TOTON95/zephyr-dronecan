@@ -83,7 +83,7 @@ dronecan0: dronecan {
 | Property | Description |
 | --- | --- |
 | `can-buses` | CAN controller used by the node. One controller is supported for now. |
-| `node-id` | Static node ID (1-127), or 0 to stay anonymous until an ID is allocated. |
+| `node-id` | Static node ID (1-127), or 0 for an anonymous node. |
 | `mem-blocks` | libcanard memory pool size in blocks (default 64). |
 
 The bus speed is not a property of the DroneCAN node. It is set on the CAN controller with the

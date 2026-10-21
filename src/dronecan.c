@@ -18,6 +18,7 @@
 #include <zephyr/sys/slist.h>
 
 #include <canard.h>
+#include <uavcan.protocol.NodeStatus.h>
 
 LOG_MODULE_REGISTER(dronecan, CONFIG_DRONECAN_LOG_LEVEL);
 
@@ -35,6 +36,7 @@ struct dronecan_config {
 	k_thread_stack_t *tx_stack;
 	size_t tx_stack_size;
 	k_thread_stack_t *hk_stack;
+	size_t hk_stack_size;
 };
 
 struct dronecan_pub {
@@ -183,6 +185,7 @@ static void rx_thread_fn(void *p1, void *p2, void *p3)
 		memcpy(cf.data, frame.data, cf.data_len);
 		LOG_DBG("rx id=0x%08x len=%u tail=0x%02x", frame.id, cf.data_len,
 			cf.data_len > 0 ? cf.data[cf.data_len - 1] : 0);
+		LOG_HEXDUMP_DBG(cf.data, cf.data_len, "rx data");
 
 		k_mutex_lock(&data->canard_mtx, K_FOREVER);
 		canardHandleRxFrame(&data->canard, &cf, k_uptime_get() * 1000ULL);
@@ -192,6 +195,60 @@ static void rx_thread_fn(void *p1, void *p2, void *p3)
 
 		if (tx_pending) {
 			k_work_submit_to_queue(&data->tx_workq, &data->tx_work);
+		}
+	}
+}
+
+// Housekeeping
+
+static const struct dronecan_msg_desc node_status_desc = {
+	.id = UAVCAN_PROTOCOL_NODESTATUS_ID,
+	.signature = UAVCAN_PROTOCOL_NODESTATUS_SIGNATURE,
+	.max_size = UAVCAN_PROTOCOL_NODESTATUS_MAX_SIZE,
+};
+
+// Broadcasts NodeStatus and drops stale partial transfers.
+static void hk_thread_fn(void *p1, void *p2, void *p3)
+{
+	const struct device *dev = p1;
+	struct dronecan_data *data = dev->data;
+	int64_t next = k_uptime_get();
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (true) {
+		next += CONFIG_DRONECAN_NODE_STATUS_PERIOD_MS;
+		k_sleep(K_TIMEOUT_ABS_MS(next));
+
+		if (!atomic_get(&data->started)) {
+			continue;
+		}
+
+		struct uavcan_protocol_NodeStatus ns = {0};
+		uint8_t buf[UAVCAN_PROTOCOL_NODESTATUS_MAX_SIZE];
+		uint8_t node_id;
+
+		// One critical section, so health, mode and vendor status are consistent.
+		k_mutex_lock(&data->canard_mtx, K_FOREVER);
+		node_id = canardGetLocalNodeID(&data->canard);
+		ns.health = data->health;
+		ns.mode = data->mode;
+		ns.vendor_specific_status_code = data->vendor_status;
+		canardCleanupStaleTransfers(&data->canard, k_uptime_get() * 1000ULL);
+		k_mutex_unlock(&data->canard_mtx);
+
+		if (node_id == DRONECAN_NODE_ID_ANON) {
+			continue; // anonymous nodes must not broadcast NodeStatus
+		}
+
+		ns.uptime_sec = k_uptime_get_32() / 1000U;
+		uint32_t len = uavcan_protocol_NodeStatus_encode(&ns, buf);
+		int ret = dronecan_broadcast(dev, &node_status_desc, DRONECAN_PRIORITY_LOW, buf,
+					     len);
+
+		if (ret != 0) {
+			LOG_DBG("NodeStatus broadcast failed: %d", ret); // e.g. stopped meanwhile
 		}
 	}
 }
@@ -225,6 +282,10 @@ static int dronecan_init(const struct device *dev)
 	k_thread_create(&data->rx_thread, cfg->rx_stack, cfg->rx_stack_size, rx_thread_fn,
 			(void *)dev, NULL, NULL, CONFIG_DRONECAN_THREAD_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&data->rx_thread, "dronecan_rx");
+
+	k_thread_create(&data->hk_thread, cfg->hk_stack, cfg->hk_stack_size, hk_thread_fn,
+			(void *)dev, NULL, NULL, CONFIG_DRONECAN_THREAD_PRIORITY, 0, K_NO_WAIT);
+	k_thread_name_set(&data->hk_thread, "dronecan_hk");
 
 	LOG_DBG("%s: node %u on %s, arena %zu bytes", dev->name, cfg->node_id,
 		cfg->can_bus[0]->name, cfg->arena_size);
@@ -289,10 +350,16 @@ int dronecan_start(const struct device *dev)
 	}
 	memset(data->pub, 0, sizeof(data->pub));
 	data->num_pub = 0;
+	data->mode = DRONECAN_MODE_OPERATIONAL;
 	k_mutex_unlock(&data->canard_mtx);
 
-	data->mode = DRONECAN_MODE_OPERATIONAL;
 	atomic_set(&data->started, 1);
+
+	if (cfg->node_id == DRONECAN_NODE_ID_ANON) {
+		LOG_WRN("%s: node ID 0 (anonymous): no NodeStatus is sent and dynamic node ID "
+			"allocation is not implemented yet",
+			dev->name);
+	}
 	ret = 0;
 out:
 	k_mutex_unlock(&data->lifecycle_mtx);
@@ -326,7 +393,9 @@ int dronecan_stop(const struct device *dev)
 		}
 		data->owns_controller = false;
 	}
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
 	data->mode = DRONECAN_MODE_OFFLINE;
+	k_mutex_unlock(&data->canard_mtx);
 out:
 	k_mutex_unlock(&data->lifecycle_mtx);
 	return ret;
@@ -355,7 +424,9 @@ int dronecan_set_health(const struct device *dev, uint8_t health)
 	if (health > DRONECAN_HEALTH_CRITICAL) {
 		return -EINVAL;
 	}
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
 	data->health = health;
+	k_mutex_unlock(&data->canard_mtx);
 	return 0;
 }
 
@@ -363,10 +434,12 @@ int dronecan_set_mode(const struct device *dev, uint8_t mode)
 {
 	struct dronecan_data *data = dev->data;
 
-	if (mode > DRONECAN_MODE_OFFLINE) {
-		return -EINVAL;
+	if (mode > DRONECAN_MODE_SOFTWARE_UPDATE && mode != DRONECAN_MODE_OFFLINE) {
+		return -EINVAL; // the DSDL defines 0-3 and 7
 	}
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
 	data->mode = mode;
+	k_mutex_unlock(&data->canard_mtx);
 	return 0;
 }
 
@@ -374,7 +447,9 @@ int dronecan_set_vendor_status(const struct device *dev, uint16_t status)
 {
 	struct dronecan_data *data = dev->data;
 
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
 	data->vendor_status = status;
+	k_mutex_unlock(&data->canard_mtx);
 	return 0;
 }
 
@@ -527,6 +602,7 @@ int dronecan_unsubscribe(const struct device *dev, struct dronecan_subscription 
 		.tx_stack = dronecan_tx_stack_##n,                                                 \
 		.tx_stack_size = K_THREAD_STACK_SIZEOF(dronecan_tx_stack_##n),                     \
 		.hk_stack = dronecan_hk_stack_##n,                                                 \
+		.hk_stack_size = K_THREAD_STACK_SIZEOF(dronecan_hk_stack_##n),                     \
 	};                                                                                         \
                                                                                                    \
 	DEVICE_DT_INST_DEFINE(n, dronecan_init, NULL, &dronecan_data_##n, &dronecan_config_##n,    \

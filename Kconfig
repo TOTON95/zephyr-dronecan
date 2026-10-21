@@ -92,6 +92,14 @@ config DRONECAN_INIT_PRIORITY
 	  Device init priority. Must be higher than CAN_INIT_PRIORITY (80 by default)
 	  so the CAN controller is ready first.
 
+config DRONECAN_NODE_STATUS_PERIOD_MS
+	int "NodeStatus broadcast period (ms)"
+	range 100 1000
+	default 1000
+	help
+	  The DroneCAN specification allows 2 to 1000 ms. Other nodes treat this node
+	  as offline after 3000 ms without a NodeStatus.
+
 config DRONECAN_RX_MSGQ_SIZE
 	int "RX frame queue depth"
 	default 32
@@ -124,8 +132,9 @@ endmenu # Resources
 menu "DSDL generation"
 
 config DRONECAN_DSDL_UAVCAN
-	bool "uavcan"
-	default y
+	def_bool y
+	help
+	  Always on: NodeStatus, which every node broadcasts, is in this namespace.
 
 config DRONECAN_DSDL_DRONECAN
 	bool "dronecan"
