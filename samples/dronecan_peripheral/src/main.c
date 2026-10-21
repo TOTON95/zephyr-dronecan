@@ -39,6 +39,19 @@ static void wait_for_console(void)
 #endif
 }
 
+static const char *can_state_name(enum can_state state)
+{
+	static const char *const names[] = {
+		[CAN_STATE_ERROR_ACTIVE] = "error-active",
+		[CAN_STATE_ERROR_WARNING] = "error-warning",
+		[CAN_STATE_ERROR_PASSIVE] = "error-passive",
+		[CAN_STATE_BUS_OFF] = "bus-off",
+		[CAN_STATE_STOPPED] = "stopped",
+	};
+
+	return (state < ARRAY_SIZE(names) && names[state] != NULL) ? names[state] : "unknown";
+}
+
 int main(void)
 {
 	struct dronecan_stats s;
@@ -65,8 +78,8 @@ int main(void)
 
 	while (1) {
 		dronecan_get_stats(dc, &s);
-		LOG_INF("tx=%u tx_err=%u, controller %d (errors tx %u rx %u)", s.tx, s.tx_err,
-			s.can_state, s.can_tx_errors, s.can_rx_errors);
+		LOG_INF("tx=%u tx_err=%u, controller %s (errors tx %u rx %u)", s.tx, s.tx_err,
+			can_state_name(s.can_state), s.can_tx_errors, s.can_rx_errors);
 		k_sleep(K_SECONDS(2));
 	}
 
