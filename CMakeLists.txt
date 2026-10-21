@@ -120,6 +120,6 @@ if(CONFIG_DRONECAN)
     src/dronecan.c
   )
 
-  zephyr_library_sources_ifdef(CONFIG_DRONECAN_SHELL src/dronecan_shell.c)
+  zephyr_library_sources_ifdef(CONFIG_DRONECAN_SHELL src/dronecan_shell.c src/dronecan_msg_table.c)
 
 endif() # CONFIG_DRONECAN

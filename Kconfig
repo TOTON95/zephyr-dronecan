@@ -201,6 +201,23 @@ config DRONECAN_SHELL_PUBLISH
 	help
 	  Publish a message type to the CAN Bus
 
+config DRONECAN_SHELL_MAX_PAYLOAD
+	int "Max payload bytes for dc publish and dc subscribe"
+	default 64
+	range 8 512
+
+config DRONECAN_SHELL_MAX_SUBSCRIPTIONS
+	int "Max dc subscribe subscriptions"
+	depends on DRONECAN_SHELL_SUBSCRIBE
+	default 4
+
+config DRONECAN_SHELL_MONITOR_TYPES
+	int "Max message types dc monitor follows"
+	depends on DRONECAN_SHELL_MONITOR
+	default 16
+	help
+	  One subscription is used per message type.
+
 # config DRONECAN_SHELL_PERIPHERAL
 # 	bool "dc peripheral"
 # 	depends on DRONECAN_DNIA_CLIENT

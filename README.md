@@ -128,6 +128,22 @@ table, then commit the result:
 python3 scripts/gen_kconfig_messages.py <DSDL directory>
 ```
 
+### Shell
+
+With `CONFIG_SHELL=y` and `CONFIG_DRONECAN_SHELL=y` the `dc` command is available. `<dev>` is the
+devicetree device name and `<msg>` the full DSDL name of an enabled message.
+
+| Command | Description |
+| --- | --- |
+| `dc list` | DroneCAN devices |
+| `dc msgs` | Enabled messages |
+| `dc status <dev>` | Node ID, counters and memory pool use |
+| `dc nodes <dev>` | Nodes seen on the bus (needs `CONFIG_DRONECAN_NODE_TABLE`) |
+| `dc subscribe <dev> <msg>` | Print each received message as hex bytes |
+| `dc unsubscribe <dev> <msg>` | Stop printing it |
+| `dc monitor <dev> on\|off\|show` | Count the messages of every enabled type |
+| `dc publish <dev> <msg> <hex>` | Broadcast raw bytes |
+
 ## Samples
 
 ### `samples/dronecan`
