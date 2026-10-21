@@ -126,6 +126,24 @@ config DRONECAN_NODE_TIMEOUT_MS
 	default 3000
 	depends on DRONECAN_NODE_TABLE
 
+config DRONECAN_MAX_RX_PAYLOAD
+	int "Largest transfer handed to subscribers (bytes)"
+	default 512
+	help
+	  Larger transfers are not delivered. One buffer is kept per node.
+
+config DRONECAN_DNIA_TIMEOUT_MS
+	int "Allocation follow-up timeout (ms)"
+	default 500
+	depends on DRONECAN_DNIA_SERVER
+
+config DRONECAN_DNIA_MAX_GRANTS
+	int "Node IDs remembered by the allocation server"
+	default 16
+	depends on DRONECAN_DNIA_SERVER
+	help
+	  A node that asks again with the same unique ID gets the same node ID.
+
 config DRONECAN_TX_DRAIN_MAX
 	int "Max frames drained per pass"
 	default 16

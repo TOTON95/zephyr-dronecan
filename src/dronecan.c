@@ -19,6 +19,7 @@
 
 #include <canard.h>
 #include <uavcan.protocol.NodeStatus.h>
+#include <uavcan.protocol.dynamic_node_id.Allocation.h>
 
 LOG_MODULE_REGISTER(dronecan, CONFIG_DRONECAN_LOG_LEVEL);
 
@@ -43,6 +44,28 @@ struct dronecan_pub {
 	uint16_t id;
 	uint8_t transfer_id;
 };
+
+#ifdef CONFIG_DRONECAN_DNIA_SERVER
+#define DNIA_ID_MIN 10
+#define DNIA_ID_MAX 125
+#define DNIA_UID_LEN 16
+
+struct dnia_grant {
+	uint8_t uid[DNIA_UID_LEN];
+	uint8_t id;
+};
+
+struct dnia {
+	enum { DNIA_IDLE, DNIA_WAIT_2, DNIA_WAIT_3 } state;
+	uint8_t uid[DNIA_UID_LEN];
+	uint8_t uid_len;
+	int64_t deadline_ms;
+	uint8_t tid;
+	struct dnia_grant grants[CONFIG_DRONECAN_DNIA_MAX_GRANTS];
+	uint8_t num_grants;
+	uint8_t next_grant;
+};
+#endif
 
 /*
  * Lock order: lifecycle_mtx -> canard_mtx -> table_mtx, canard_mtx -> sub_mtx.
@@ -79,6 +102,14 @@ struct dronecan_data {
 	struct dronecan_pub pub[CONFIG_DRONECAN_MAX_PUBLISHED_TYPES];
 	uint8_t num_pub;
 
+	// Written and read by the RX thread only
+	struct dronecan_transfer rx_info;
+	uint8_t rx_payload[CONFIG_DRONECAN_MAX_RX_PAYLOAD];
+	bool rx_ready;
+#ifdef CONFIG_DRONECAN_DNIA_SERVER
+	struct dnia dnia; // canard_mtx
+#endif
+
 	struct dronecan_stats stats;
 #ifdef CONFIG_DRONECAN_NODE_TABLE
 	struct dronecan_node_entry node_table[DRONECAN_MAX_NODES];
@@ -87,23 +118,275 @@ struct dronecan_data {
 
 // libcanard callbacks
 
+// libcanard treats a timestamp of 0 as an uninitialised receive state, so never return 0.
+static uint64_t canard_time_usec(void)
+{
+	return k_ticks_to_us_floor64(k_uptime_ticks()) + 1U;
+}
+
+// Signature of a message somebody subscribed to. Call with canard_mtx held.
+static bool find_signature(struct dronecan_data *data, uint16_t id, uint64_t *signature)
+{
+	struct dronecan_subscription *sub;
+	bool found = false;
+
+	k_mutex_lock(&data->sub_mtx, K_FOREVER);
+	SYS_SLIST_FOR_EACH_CONTAINER(&data->subs, sub, node) {
+		if (sub->data_type_id == id) {
+			*signature = sub->signature;
+			found = true;
+			break;
+		}
+	}
+	k_mutex_unlock(&data->sub_mtx);
+	return found;
+}
+
+#ifdef CONFIG_DRONECAN_NODE_TABLE
+static void node_status_update(struct dronecan_data *data, const CanardRxTransfer *t)
+{
+	struct uavcan_protocol_NodeStatus ns;
+	struct dronecan_node_entry *e;
+
+	if (t->source_node_id >= DRONECAN_MAX_NODES || uavcan_protocol_NodeStatus_decode(t, &ns)) {
+		return;
+	}
+
+	k_mutex_lock(&data->table_mtx, K_FOREVER);
+	e = &data->node_table[t->source_node_id];
+	e->active = true;
+	e->last_seen_ms = k_uptime_get_32();
+	e->uptime_sec = ns.uptime_sec;
+	e->health = ns.health;
+	e->mode = ns.mode;
+	e->vendor_status = ns.vendor_specific_status_code;
+	k_mutex_unlock(&data->table_mtx);
+
+	data->stats.rx_ns++;
+}
+
+static void expire_nodes(struct dronecan_data *data)
+{
+	uint32_t now = k_uptime_get_32();
+
+	k_mutex_lock(&data->table_mtx, K_FOREVER);
+	for (int i = 1; i < DRONECAN_MAX_NODES; i++) {
+		struct dronecan_node_entry *e = &data->node_table[i];
+
+		if (e->active && now - e->last_seen_ms > CONFIG_DRONECAN_NODE_TIMEOUT_MS) {
+			e->active = false;
+		}
+	}
+	k_mutex_unlock(&data->table_mtx);
+}
+#endif
+
+#ifdef CONFIG_DRONECAN_DNIA_SERVER
+// Returns the node ID granted to this unique ID, or grants a new one if it has none.
+// Returns 0 when no ID is free. Call with canard_mtx held.
+static uint8_t dnia_grant_id(struct dronecan_data *data, const uint8_t *uid)
+{
+	struct dnia *d = &data->dnia;
+	uint8_t own = canardGetLocalNodeID(&data->canard);
+
+	for (int i = 0; i < d->num_grants; i++) {
+		if (memcmp(d->grants[i].uid, uid, DNIA_UID_LEN) == 0) {
+			return d->grants[i].id;
+		}
+	}
+
+	for (uint8_t id = DNIA_ID_MIN; id <= DNIA_ID_MAX; id++) {
+		bool used = id == own;
+
+		for (int i = 0; i < d->num_grants && !used; i++) {
+			used = d->grants[i].id == id;
+		}
+		if (!used) {
+			k_mutex_lock(&data->table_mtx, K_FOREVER);
+			used = data->node_table[id].active;
+			k_mutex_unlock(&data->table_mtx);
+		}
+		if (!used) {
+			struct dnia_grant *g = &d->grants[d->next_grant];
+
+			memcpy(g->uid, uid, DNIA_UID_LEN);
+			g->id = id;
+			d->next_grant = (d->next_grant + 1) % ARRAY_SIZE(d->grants);
+			if (d->num_grants < ARRAY_SIZE(d->grants)) {
+				d->num_grants++;
+			}
+			return id;
+		}
+	}
+	return 0;
+}
+
+static void dnia_handle(struct dronecan_data *data, CanardRxTransfer *t)
+{
+	struct uavcan_protocol_dynamic_node_id_Allocation req;
+	struct uavcan_protocol_dynamic_node_id_Allocation rsp = {0};
+	uint8_t buf[UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_MAX_SIZE];
+	struct dnia *d = &data->dnia;
+	int64_t now = k_uptime_get();
+	bool last = false;
+
+	// Only anonymous nodes ask, and an anonymous node cannot answer
+	if (t->source_node_id != DRONECAN_NODE_ID_ANON ||
+	    canardGetLocalNodeID(&data->canard) == DRONECAN_NODE_ID_ANON ||
+	    uavcan_protocol_dynamic_node_id_Allocation_decode(t, &req)) {
+		return;
+	}
+	canardReleaseRxTransferPayload(&data->canard, t); // we send from this callback
+	data->stats.alloc_rx++;
+
+	if (d->state != DNIA_IDLE && now > d->deadline_ms) {
+		d->state = DNIA_IDLE;
+	}
+
+	if (req.first_part_of_unique_id) {
+		d->uid_len = 0;
+		d->state = DNIA_WAIT_2;
+		data->stats.alloc_s1++;
+	} else if (d->state == DNIA_WAIT_2) {
+		d->state = DNIA_WAIT_3;
+		data->stats.alloc_s2++;
+	} else if (d->state == DNIA_WAIT_3) {
+		d->state = DNIA_IDLE;
+		data->stats.alloc_s3++;
+		last = true;
+	} else {
+		return;
+	}
+
+	if (d->uid_len + req.unique_id.len > DNIA_UID_LEN) {
+		d->state = DNIA_IDLE;
+		return;
+	}
+	memcpy(d->uid + d->uid_len, req.unique_id.data, req.unique_id.len);
+	d->uid_len += req.unique_id.len;
+	d->deadline_ms = now + CONFIG_DRONECAN_DNIA_TIMEOUT_MS;
+
+	rsp.unique_id.len = d->uid_len;
+	memcpy(rsp.unique_id.data, d->uid, d->uid_len);
+
+	if (last) {
+		if (d->uid_len != DNIA_UID_LEN) {
+			return;
+		}
+		rsp.node_id = dnia_grant_id(data, d->uid);
+		if (rsp.node_id == 0) {
+			return; // no free ID
+		}
+		data->stats.alloc_grant++;
+		data->stats.last_grant_id = rsp.node_id;
+	}
+
+	canardBroadcast(&data->canard, UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_SIGNATURE,
+			UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID, &d->tid,
+			CANARD_TRANSFER_PRIORITY_MEDIUM, buf,
+			uavcan_protocol_dynamic_node_id_Allocation_encode(&rsp, buf));
+}
+#endif
+
 static bool dronecan_should_accept(const CanardInstance *ins, uint64_t *out_signature,
 				   uint16_t data_type_id, CanardTransferType transfer_type,
 				   uint8_t source_node_id)
 {
-	ARG_UNUSED(ins);
-	ARG_UNUSED(out_signature);
-	ARG_UNUSED(data_type_id);
-	ARG_UNUSED(transfer_type);
-	ARG_UNUSED(source_node_id);
+	struct dronecan_data *data = ins->user_reference;
 
-	return false;
+	if (transfer_type != CanardTransferTypeBroadcast) {
+		return false;
+	}
+
+#ifdef CONFIG_DRONECAN_DNIA_SERVER
+	if (data_type_id == UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID) {
+		*out_signature = UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_SIGNATURE;
+		return true;
+	}
+#endif
+	if (source_node_id == DRONECAN_NODE_ID_ANON) {
+		return false;
+	}
+#ifdef CONFIG_DRONECAN_NODE_TABLE
+	if (data_type_id == UAVCAN_PROTOCOL_NODESTATUS_ID) {
+		*out_signature = UAVCAN_PROTOCOL_NODESTATUS_SIGNATURE;
+		return true;
+	}
+#endif
+	return find_signature(data, data_type_id, out_signature);
+}
+
+// Copy the transfer for the subscribers, which run after canard_mtx is released.
+static void queue_rx(struct dronecan_data *data, const CanardRxTransfer *t)
+{
+	uint64_t signature;
+	uint16_t len = t->payload_len;
+
+	if (len > sizeof(data->rx_payload) || !find_signature(data, t->data_type_id, &signature)) {
+		return;
+	}
+	for (uint16_t i = 0; i < len; i++) {
+		canardDecodeScalar(t, i * 8U, 8, false, &data->rx_payload[i]);
+	}
+	data->rx_info = (struct dronecan_transfer){
+		.source_node_id = t->source_node_id,
+		.data_type_id = t->data_type_id,
+		.transfer_id = t->transfer_id,
+		.priority = t->priority,
+		.payload = data->rx_payload,
+		.payload_len = len,
+		.timestamp_ms = t->timestamp_usec / 1000U,
+	};
+	data->rx_ready = true;
 }
 
 static void dronecan_on_reception(CanardInstance *ins, CanardRxTransfer *transfer)
 {
-	ARG_UNUSED(ins);
-	ARG_UNUSED(transfer);
+	struct dronecan_data *data = ins->user_reference;
+
+	queue_rx(data, transfer); // first: the handlers below may release the payload
+
+	switch (transfer->data_type_id) {
+#ifdef CONFIG_DRONECAN_NODE_TABLE
+	case UAVCAN_PROTOCOL_NODESTATUS_ID:
+		node_status_update(data, transfer);
+		break;
+#endif
+#ifdef CONFIG_DRONECAN_DNIA_SERVER
+	case UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID:
+		dnia_handle(data, transfer);
+		break;
+#endif
+	default:
+		break;
+	}
+}
+
+// Call the subscribers of the queued transfer. No lock is held while they run.
+static void dispatch_rx(const struct device *dev)
+{
+	struct dronecan_data *data = dev->data;
+	sys_snode_t *node;
+
+	k_mutex_lock(&data->sub_mtx, K_FOREVER);
+	for (node = sys_slist_peek_head(&data->subs); node != NULL; node = sys_slist_peek_next(node)) {
+		struct dronecan_subscription *sub = CONTAINER_OF(node, struct dronecan_subscription, node);
+		dronecan_rx_cb_t cb = sub->cb;
+		void *user_data = sub->user_data;
+
+		if (sub->data_type_id != data->rx_info.data_type_id) {
+			continue;
+		}
+		data->in_flight = sub;
+		k_mutex_unlock(&data->sub_mtx);
+
+		cb(dev, &data->rx_info, user_data);
+
+		k_mutex_lock(&data->sub_mtx, K_FOREVER);
+		data->in_flight = NULL;
+		k_condvar_broadcast(&data->sub_cv);
+	}
+	k_mutex_unlock(&data->sub_mtx);
 }
 
 // TX path
@@ -244,13 +527,18 @@ static void rx_thread_fn(void *p1, void *p2, void *p3)
 		LOG_HEXDUMP_DBG(cf.data, cf.data_len, "rx data");
 
 		k_mutex_lock(&data->canard_mtx, K_FOREVER);
-		canardHandleRxFrame(&data->canard, &cf, k_uptime_get() * 1000ULL);
+		canardHandleRxFrame(&data->canard, &cf, canard_time_usec());
 		bool tx_pending = canardPeekTxQueue(&data->canard) != NULL;
 
 		k_mutex_unlock(&data->canard_mtx);
 
 		if (tx_pending) {
 			k_work_submit_to_queue(&data->tx_workq, &data->tx_work);
+		}
+
+		if (data->rx_ready) {
+			data->rx_ready = false;
+			dispatch_rx(dev);
 		}
 	}
 }
@@ -291,8 +579,12 @@ static void hk_thread_fn(void *p1, void *p2, void *p3)
 		ns.health = data->health;
 		ns.mode = data->mode;
 		ns.vendor_specific_status_code = data->vendor_status;
-		canardCleanupStaleTransfers(&data->canard, k_uptime_get() * 1000ULL);
+		canardCleanupStaleTransfers(&data->canard, canard_time_usec());
 		k_mutex_unlock(&data->canard_mtx);
+
+#ifdef CONFIG_DRONECAN_NODE_TABLE
+		expire_nodes(data);
+#endif
 
 		if (node_id == DRONECAN_NODE_ID_ANON) {
 			continue; // anonymous nodes must not broadcast NodeStatus
@@ -398,6 +690,11 @@ int dronecan_start(const struct device *dev)
 	}
 
 	memset(&data->stats, 0, sizeof(data->stats));
+#ifdef CONFIG_DRONECAN_NODE_TABLE
+	k_mutex_lock(&data->table_mtx, K_FOREVER);
+	memset(data->node_table, 0, sizeof(data->node_table));
+	k_mutex_unlock(&data->table_mtx);
+#endif
 	data->tx_stuck = false;
 	k_sem_reset(&data->tx_done);
 
@@ -409,14 +706,17 @@ int dronecan_start(const struct device *dev)
 	}
 	memset(data->pub, 0, sizeof(data->pub));
 	data->num_pub = 0;
+#ifdef CONFIG_DRONECAN_DNIA_SERVER
+	memset(&data->dnia, 0, sizeof(data->dnia));
+#endif
 	data->mode = DRONECAN_MODE_OPERATIONAL;
 	k_mutex_unlock(&data->canard_mtx);
 
 	atomic_set(&data->started, 1);
 
 	if (cfg->node_id == DRONECAN_NODE_ID_ANON) {
-		LOG_WRN("%s: node ID 0 (anonymous): no NodeStatus is sent and dynamic node ID "
-			"allocation is not implemented yet",
+		LOG_WRN("%s: node ID 0 (anonymous): no NodeStatus is sent and no node ID is "
+			"requested, the allocation client is not implemented yet",
 			dev->name);
 	}
 	ret = 0;
@@ -614,19 +914,47 @@ void dronecan_get_stats(const struct device *dev, struct dronecan_stats *out)
 int dronecan_subscribe(const struct device *dev, struct dronecan_subscription *sub,
 		       const struct dronecan_msg_desc *desc, dronecan_rx_cb_t cb, void *user_data)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(sub);
-	ARG_UNUSED(desc);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(user_data);
-	return -ENOSYS;
+	struct dronecan_data *data = dev->data;
+	sys_snode_t *node;
+
+	if (sub == NULL || desc == NULL || cb == NULL) {
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&data->sub_mtx, K_FOREVER);
+	SYS_SLIST_FOR_EACH_NODE(&data->subs, node) {
+		if (node == &sub->node) {
+			k_mutex_unlock(&data->sub_mtx);
+			return -EALREADY;
+		}
+	}
+	sub->data_type_id = desc->id;
+	sub->signature = desc->signature;
+	sub->cb = cb;
+	sub->user_data = user_data;
+	sys_slist_append(&data->subs, &sub->node);
+	k_mutex_unlock(&data->sub_mtx);
+	return 0;
 }
 
 int dronecan_unsubscribe(const struct device *dev, struct dronecan_subscription *sub)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(sub);
-	return -ENOSYS;
+	struct dronecan_data *data = dev->data;
+
+	if (sub == NULL) {
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&data->sub_mtx, K_FOREVER);
+	if (!sys_slist_find_and_remove(&data->subs, &sub->node)) {
+		k_mutex_unlock(&data->sub_mtx);
+		return -ENOENT;
+	}
+	while (data->in_flight == sub) {
+		k_condvar_wait(&data->sub_cv, &data->sub_mtx, K_FOREVER);
+	}
+	k_mutex_unlock(&data->sub_mtx);
+	return 0;
 }
 
 // Instances

@@ -67,6 +67,7 @@ typedef void (*dronecan_rx_cb_t)(const struct device *dev,
 struct dronecan_subscription {
 	sys_snode_t node;
 	uint16_t data_type_id;
+	uint64_t signature;
 	dronecan_rx_cb_t cb;
 	void *user_data;
 };
