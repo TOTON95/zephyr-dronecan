@@ -2,6 +2,8 @@ name: zephyr-dronecan
 build:
   kconfig: Kconfig
   cmake: .
+  settings:
+    dts_root: .
 samples:
   - samples
 tests:

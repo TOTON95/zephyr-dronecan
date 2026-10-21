@@ -1,0 +1,28 @@
+# Copyright (c) 2026 3DR, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  DroneCAN (UAVCAN v0) node. Provisional compatible, see the module README.
+
+compatible: "zephyr,dronecan"
+
+include: base.yaml
+
+properties:
+  can-buses:
+    type: phandles
+    required: true
+    description: |
+      CAN controllers this node uses. One entry for now.
+
+  node-id:
+    type: int
+    default: 0
+    description: |
+      Static node ID (1-127), or 0 to stay anonymous until allocated.
+
+  mem-blocks:
+    type: int
+    default: 64
+    description: |
+      libcanard memory pool size in blocks.

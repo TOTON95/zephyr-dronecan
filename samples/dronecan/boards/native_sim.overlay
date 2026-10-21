@@ -1,0 +1,8 @@
+/ {
+	dronecan0: dronecan {
+		compatible = "zephyr,dronecan";
+		can-buses = <&can_loopback0>;
+		node-id = <42>;
+		status = "okay";
+	};
+};

@@ -66,8 +66,9 @@ or install only this module's packages with `pip install -r requirements.txt`.
 
 ### Devicetree
 
-A DroneCAN node is described in devicetree and attached to a CAN controller. This is the proposed
-definition (the binding is not in the repository yet and may change):
+A DroneCAN node is described in devicetree and attached to a CAN controller. The binding is
+[`dts/bindings/zephyr,dronecan.yaml`](dts/bindings/zephyr,dronecan.yaml) and may change while the
+`zephyr` vendor prefix is pending approval:
 
 ```dts
 dronecan0: dronecan {
@@ -116,6 +117,19 @@ CONFIG_DRONECAN=y
 ```
 
 ## Samples
+
+### `samples/dronecan`
+
+A minimal application that declares a DroneCAN node in devicetree and calls the public API. It has
+overlays for `native_sim` (the node sits on the CAN loopback controller) and for the 3DR Control N1.
+
+```sh
+west build -b native_sim samples/dronecan
+west build -b control_n1 samples/dronecan
+```
+
+If the DSDL projects are not in the default location, point CMake at them with
+`-DDRONECAN_DSDL_DIR=<path>` and `-DDRONECAN_DSDLC_DIR=<path>`.
 
 ## Tests
 
