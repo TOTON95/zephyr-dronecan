@@ -25,12 +25,14 @@ config DRONECAN_NODE_TABLE
 config DRONECAN_DNIA_SERVER
 	bool "Dynamic Node ID allocation server"
 	select DRONECAN_NODE_TABLE
+	select DRONECAN_MSG_UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION
 	help
 	  Act as the DNIA allocator (like a flight controller).
 
 config DRONECAN_DNIA_CLIENT
 	bool "Dynamic Node ID allocation client"
 	select HWINFO
+	select DRONECAN_MSG_UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION
 	help
 	  Request a node ID from an allocator, using the hardware unique ID (like a peripheral).
 

@@ -91,8 +91,21 @@ if(CONFIG_DRONECAN)
     file(WRITE ${_stamp} "${_ns_roots}")
   endif()
 
-  # TODO: this can be filtered by DRONECAN_MSG_*
-  file(GLOB_RECURSE _dsdl_gen_srcs ${_gen_dir}/src/*.c)
+  # Build only the messages enabled in Kconfig. Types without a DRONECAN_MSG_* symbol (nested
+  # types and services) are always built.
+  file(STRINGS ${CMAKE_CURRENT_LIST_DIR}/Kconfig.messages _msg_lines REGEX "^config DRONECAN_MSG_")
+  string(REGEX REPLACE "config " "" _msg_symbols "${_msg_lines}")
+  file(GLOB _dsdl_all_srcs ${_gen_dir}/src/*.c)
+  set(_dsdl_gen_srcs "")
+  foreach(_src ${_dsdl_all_srcs})
+    get_filename_component(_type ${_src} NAME)
+    string(REGEX REPLACE "\\.c$" "" _type ${_type})
+    string(TOUPPER ${_type} _type)
+    string(REPLACE "." "_" _sym DRONECAN_MSG_${_type})
+    if(NOT _sym IN_LIST _msg_symbols OR CONFIG_${_sym})
+      list(APPEND _dsdl_gen_srcs ${_src})
+    endif()
+  endforeach()
 
   # Build
   zephyr_include_directories(

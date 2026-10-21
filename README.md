@@ -16,6 +16,7 @@ Built on [libcanard](https://github.com/dronecan/libcanard/), with devicetree-co
 - Kconfig-selectable message set (so unused DSDL code is not built)
 - Optional shell commands (`CONFIG_DRONECAN_SHELL`): list nodes, show stats, monitor and subscribe to messages, publish test messages
 - *Planned:* GetNodeInfo, parameter get/set, RestartNode, firmware update
+- *Planned:* shell commands that decode and print message fields, and publish messages from field values (today they take message names and raw hex bytes)
 
 ## Requirements
 
@@ -114,6 +115,17 @@ Then enable the module in `prj.conf`:
 ```ini
 CONFIG_CAN=y
 CONFIG_DRONECAN=y
+```
+
+### Messages
+
+Every broadcast message type is a Kconfig option (`CONFIG_DRONECAN_MSG_<NAMESPACE>_<NAME>`), and
+only the enabled ones are built. NodeStatus is always on, and the DNIA options select the
+allocation message. After the DSDL revision changes, regenerate the options and the message
+table, then commit the result:
+
+```sh
+python3 scripts/gen_kconfig_messages.py <DSDL directory>
 ```
 
 ## Samples
