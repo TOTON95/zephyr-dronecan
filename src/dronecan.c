@@ -896,8 +896,15 @@ int dronecan_get_node(const struct device *dev, uint8_t id, struct dronecan_node
 void dronecan_get_stats(const struct device *dev, struct dronecan_stats *out)
 {
 	struct dronecan_data *data = dev->data;
+	const struct dronecan_config *cfg = dev->config;
+	struct can_bus_err_cnt err = {0};
 
 	*out = data->stats; // counters are not read atomically
+
+	if (can_get_state(cfg->can_bus[0], &out->can_state, &err) == 0) {
+		out->can_tx_errors = err.tx_err_cnt;
+		out->can_rx_errors = err.rx_err_cnt;
+	}
 
 	if (atomic_get(&data->started)) {
 		k_mutex_lock(&data->canard_mtx, K_FOREVER);

@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <zephyr/drivers/can.h>
 #include <zephyr/sys/slist.h>
 
 #ifdef __cplusplus
@@ -87,6 +88,11 @@ struct dronecan_stats {
 	uint32_t mem_capacity;	// total blocks in arena
 	uint32_t mem_current;	// blocks in use right now
 	uint32_t mem_peak;	// peak blocks ever used
+
+	// CAN controller, read when asked
+	enum can_state can_state;
+	uint8_t can_tx_errors;	// transmit error counter
+	uint8_t can_rx_errors;	// receive error counter
 };
 
 struct dronecan_node_entry {

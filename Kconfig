@@ -211,6 +211,11 @@ config DRONECAN_SHELL_MAX_SUBSCRIPTIONS
 	depends on DRONECAN_SHELL_SUBSCRIBE
 	default 4
 
+config DRONECAN_SHELL_MAX_PUBLISHERS
+	int "Max messages dc publish repeats"
+	depends on DRONECAN_SHELL_PUBLISH
+	default 2
+
 config DRONECAN_SHELL_MONITOR_TYPES
 	int "Max message types dc monitor follows"
 	depends on DRONECAN_SHELL_MONITOR

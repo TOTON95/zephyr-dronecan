@@ -4,9 +4,12 @@
  */
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <zephyr/device.h>
+#include <zephyr/drivers/can.h>
+#include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/sys/util.h>
@@ -58,6 +61,19 @@ static int cmd_msgs(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static const char *can_state_name(enum can_state state)
+{
+	static const char *const names[] = {
+		[CAN_STATE_ERROR_ACTIVE] = "error-active",
+		[CAN_STATE_ERROR_WARNING] = "error-warning",
+		[CAN_STATE_ERROR_PASSIVE] = "error-passive",
+		[CAN_STATE_BUS_OFF] = "bus-off",
+		[CAN_STATE_STOPPED] = "stopped",
+	};
+
+	return (state < ARRAY_SIZE(names) && names[state] != NULL) ? names[state] : "unknown";
+}
+
 static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 {
 	const struct device *dev = find_dev(sh, argv[1]);
@@ -74,6 +90,8 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 		    s.alloc_s1, s.alloc_s2, s.alloc_s3, s.alloc_grant, s.last_grant_id);
 	shell_print(sh, "pool       %u/%u blocks (peak %u)", s.mem_current, s.mem_capacity,
 		    s.mem_peak);
+	shell_print(sh, "controller %s, error counters tx %u rx %u", can_state_name(s.can_state),
+		    s.can_tx_errors, s.can_rx_errors);
 	return 0;
 }
 
@@ -102,18 +120,62 @@ static int cmd_nodes(const struct shell *sh, size_t argc, char **argv)
 }
 
 #ifdef CONFIG_DRONECAN_SHELL_PUBLISH
+struct dc_pub {
+	struct k_work_delayable work;
+	const struct device *dev;
+	const struct dronecan_msg_entry *msg;
+	uint8_t payload[CONFIG_DRONECAN_SHELL_MAX_PAYLOAD];
+	uint16_t len;
+	uint32_t period_ms;
+};
+
+static struct dc_pub dc_pubs[CONFIG_DRONECAN_SHELL_MAX_PUBLISHERS];
+
+static void pub_work(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct dc_pub *p = CONTAINER_OF(dwork, struct dc_pub, work);
+
+	dronecan_broadcast(p->dev, &p->msg->desc, DRONECAN_PRIORITY_MEDIUM, p->payload, p->len);
+	k_work_reschedule(dwork, K_MSEC(p->period_ms));
+}
+
+static struct dc_pub *find_pub(const struct device *dev, const struct dronecan_msg_entry *m)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(dc_pubs); i++) {
+		if (dc_pubs[i].msg == m && dc_pubs[i].dev == dev) {
+			return &dc_pubs[i];
+		}
+	}
+	return NULL;
+}
+
 static int cmd_publish(const struct shell *sh, size_t argc, char **argv)
 {
 	const struct device *dev = find_dev(sh, argv[1]);
 	const struct dronecan_msg_entry *m = find_msg(sh, argv[2]);
 	uint8_t payload[CONFIG_DRONECAN_SHELL_MAX_PAYLOAD];
 	char hex[2 * sizeof(payload) + 1] = "";
+	unsigned long rate_hz = 0;
 	size_t len;
 	int ret;
 
 	if (dev == NULL || m == NULL) {
 		return -EINVAL;
 	}
+
+	// An optional "-r <hz>" at the end repeats the message
+	if (argc >= 6 && strcmp(argv[argc - 2], "-r") == 0) {
+		char *end;
+
+		rate_hz = strtoul(argv[argc - 1], &end, 10);
+		if (*end != '\0' || rate_hz < 1 || rate_hz > 1000) {
+			shell_error(sh, "rate must be 1 to 1000 Hz");
+			return -EINVAL;
+		}
+		argc -= 2;
+	}
+
 	// The bytes can be given as one string or as several arguments
 	for (size_t i = 3; i < argc; i++) {
 		if (strlen(hex) + strlen(argv[i]) >= sizeof(hex)) {
@@ -130,9 +192,61 @@ static int cmd_publish(const struct shell *sh, size_t argc, char **argv)
 	ret = dronecan_broadcast(dev, &m->desc, DRONECAN_PRIORITY_MEDIUM, payload, len / 2);
 	if (ret != 0) {
 		shell_error(sh, "broadcast failed: %d", ret);
+		return ret;
 	}
-	return ret;
+
+	if (rate_hz > 0) {
+		struct dc_pub *p = find_pub(dev, m);
+
+		if (p == NULL) {
+			p = find_pub(NULL, NULL);
+		}
+		if (p == NULL) {
+			shell_error(sh, "at most %d repeated messages",
+				    CONFIG_DRONECAN_SHELL_MAX_PUBLISHERS);
+			return -ENOMEM;
+		}
+		k_work_cancel_delayable_sync(&p->work, &(struct k_work_sync){0});
+		p->dev = dev;
+		p->msg = m;
+		memcpy(p->payload, payload, len / 2);
+		p->len = len / 2;
+		p->period_ms = 1000U / rate_hz;
+		k_work_reschedule(&p->work, K_MSEC(p->period_ms));
+		shell_print(sh, "repeating at %lu Hz, stop with 'dc unpublish %s %s'", rate_hz,
+			    dev->name, m->name);
+	}
+	return 0;
 }
+
+static int cmd_unpublish(const struct shell *sh, size_t argc, char **argv)
+{
+	const struct device *dev = find_dev(sh, argv[1]);
+	const struct dronecan_msg_entry *m = find_msg(sh, argv[2]);
+	struct dc_pub *p;
+
+	if (dev == NULL || m == NULL) {
+		return -EINVAL;
+	}
+	p = find_pub(dev, m);
+	if (p == NULL) {
+		shell_error(sh, "not repeating");
+		return -ENOENT;
+	}
+	k_work_cancel_delayable_sync(&p->work, &(struct k_work_sync){0});
+	p->dev = NULL;
+	p->msg = NULL;
+	return 0;
+}
+
+static int pubs_init(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(dc_pubs); i++) {
+		k_work_init_delayable(&dc_pubs[i].work, pub_work);
+	}
+	return 0;
+}
+SYS_INIT(pubs_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 #endif // CONFIG_DRONECAN_SHELL_PUBLISH
 
 #ifdef CONFIG_DRONECAN_SHELL_SUBSCRIBE
@@ -328,8 +442,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(dc_cmds,
 		      "Usage: dc unsubscribe <device> <message>", cmd_unsubscribe, 3, 0),
 #endif
 #ifdef CONFIG_DRONECAN_SHELL_PUBLISH
-	SHELL_CMD_ARG(publish, NULL, "Broadcast a message from hex bytes\n"
-		      "Usage: dc publish <device> <message> <hex bytes>", cmd_publish, 4, 8),
+	SHELL_CMD_ARG(publish, NULL, "Broadcast a message from hex bytes, once or repeated\n"
+		      "Usage: dc publish <device> <message> <hex bytes> [-r <hz>]", cmd_publish, 4, 10),
+	SHELL_CMD_ARG(unpublish, NULL, "Stop a repeated message\n"
+		      "Usage: dc unpublish <device> <message>", cmd_unpublish, 3, 0),
 #endif
 	SHELL_SUBCMD_SET_END);
 

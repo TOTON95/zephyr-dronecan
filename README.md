@@ -137,12 +137,13 @@ devicetree device name and `<msg>` the full DSDL name of an enabled message.
 | --- | --- |
 | `dc list` | DroneCAN devices |
 | `dc msgs` | Enabled messages |
-| `dc status <dev>` | Node ID, counters and memory pool use |
+| `dc status <dev>` | Node ID, counters, memory pool use and CAN controller state and error counters |
 | `dc nodes <dev>` | Nodes seen on the bus (needs `CONFIG_DRONECAN_NODE_TABLE`) |
 | `dc subscribe <dev> <msg>` | Print each received message as hex bytes |
 | `dc unsubscribe <dev> <msg>` | Stop printing it |
 | `dc monitor <dev> on\|off\|show` | Count the messages of every enabled type |
-| `dc publish <dev> <msg> <hex>` | Broadcast raw bytes |
+| `dc publish <dev> <msg> <hex> [-r <hz>]` | Broadcast raw bytes, once or repeated at a rate |
+| `dc unpublish <dev> <msg>` | Stop a repeated message |
 
 ## Samples
 
