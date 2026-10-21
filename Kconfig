@@ -108,6 +108,13 @@ config DRONECAN_TX_TIMEOUT_MS
 	int "CAN send timeout (ms)"
 	default 10
 
+config DRONECAN_TX_ACK_TIMEOUT_MS
+	int "Time to wait for a frame to be acknowledged (ms)"
+	default 100
+	help
+	  Without an ACK the controller retries forever. After this time the node
+	  drops its queued frames until the bus answers again.
+
 config DRONECAN_LOOPBACK_MODE
 	bool "Start the CAN controller in loopback mode"
 	help

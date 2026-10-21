@@ -63,6 +63,9 @@ struct dronecan_data {
 	struct k_thread rx_thread;
 	struct k_work_q tx_workq; // one sender, so frames leave in queue order
 	struct k_work tx_work;
+	struct k_sem tx_done;
+	int tx_status;
+	bool tx_stuck; // only used by the TX work
 	struct k_thread hk_thread;
 
 	atomic_t started;
@@ -128,6 +131,28 @@ static int drain_tx(struct dronecan_data *data, struct can_frame *out, int max)
 	return n;
 }
 
+static void tx_done_cb(const struct device *can, int error, void *user_data)
+{
+	struct dronecan_data *data = user_data;
+
+	ARG_UNUSED(can);
+	data->tx_status = error;
+	k_sem_give(&data->tx_done);
+}
+
+// Drop the frames libcanard has queued. Call with canard_mtx held.
+static int drop_tx(struct dronecan_data *data)
+{
+	int n = 0;
+
+	while (canardPeekTxQueue(&data->canard) != NULL) {
+		canardPopTxQueue(&data->canard);
+		n++;
+	}
+	return n;
+}
+
+// One frame at a time. Without an ACK the frame is dropped after a timeout instead of blocking.
 static void tx_work_handler(struct k_work *work)
 {
 	struct dronecan_data *data = CONTAINER_OF(work, struct dronecan_data, tx_work);
@@ -135,20 +160,51 @@ static void tx_work_handler(struct k_work *work)
 	struct can_frame frames[CONFIG_DRONECAN_TX_DRAIN_MAX];
 	int n;
 
+	if (data->tx_stuck && k_sem_take(&data->tx_done, K_NO_WAIT) == 0) {
+		data->tx_stuck = false;
+		if (data->tx_status == 0) {
+			data->stats.tx++;
+		} else {
+			data->stats.tx_err++;
+		}
+		LOG_INF("%s: the CAN bus answers again", data->dev->name);
+	}
+
 	do {
 		k_mutex_lock(&data->canard_mtx, K_FOREVER);
+		if (data->tx_stuck) {
+			data->stats.tx_err += drop_tx(data);
+			k_mutex_unlock(&data->canard_mtx);
+			return;
+		}
 		n = drain_tx(data, frames, ARRAY_SIZE(frames));
 		k_mutex_unlock(&data->canard_mtx);
 
 		for (int i = 0; i < n; i++) {
 			int ret = can_send(cfg->can_bus[0], &frames[i],
-					   K_MSEC(CONFIG_DRONECAN_TX_TIMEOUT_MS), NULL, NULL);
+					   K_MSEC(CONFIG_DRONECAN_TX_TIMEOUT_MS), tx_done_cb, data);
 
-			if (ret == 0) {
+			if (ret != 0) {
+				data->stats.tx_err++;
+				LOG_DBG("can_send failed: %d", ret);
+				continue;
+			}
+
+			if (k_sem_take(&data->tx_done, K_MSEC(CONFIG_DRONECAN_TX_ACK_TIMEOUT_MS)) != 0) {
+				data->tx_stuck = true;
+				data->stats.tx_err += n - i - 1;
+				k_mutex_lock(&data->canard_mtx, K_FOREVER);
+				data->stats.tx_err += drop_tx(data);
+				k_mutex_unlock(&data->canard_mtx);
+				LOG_WRN("%s: no ACK on the CAN bus, dropping frames until it answers",
+					data->dev->name);
+				return;
+			}
+
+			if (data->tx_status == 0) {
 				data->stats.tx++;
 			} else {
 				data->stats.tx_err++;
-				LOG_DBG("can_send failed: %d", ret);
 			}
 		}
 	} while (n == ARRAY_SIZE(frames));
@@ -269,6 +325,7 @@ static int dronecan_init(const struct device *dev)
 	k_mutex_init(&data->sub_mtx);
 	k_condvar_init(&data->sub_cv);
 	sys_slist_init(&data->subs);
+	k_sem_init(&data->tx_done, 0, 1);
 
 	data->health = DRONECAN_HEALTH_OK;
 	data->mode = DRONECAN_MODE_INITIALIZATION;
@@ -341,6 +398,8 @@ int dronecan_start(const struct device *dev)
 	}
 
 	memset(&data->stats, 0, sizeof(data->stats));
+	data->tx_stuck = false;
+	k_sem_reset(&data->tx_done);
 
 	k_mutex_lock(&data->canard_mtx, K_FOREVER);
 	canardInit(&data->canard, cfg->arena, cfg->arena_size, dronecan_on_reception,
