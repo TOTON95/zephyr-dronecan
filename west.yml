@@ -1,0 +1,26 @@
+# Copyright (c) 2026 3DR, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+
+manifest:
+  remotes: 
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: main
+      clone-depth: 1
+      import:
+        name-allowlist:
+          - cmsis_6
+          - hal_stm32
+    - name: DSDL
+      url: https://github.com/dronecan/DSDL.git
+      revision: b4653c7abc3c47cb31b16efa24ea755232774756
+      path: lib/DSDL
+    - name: dronecan_dsdlc
+      url: https://github.com/dronecan/dronecan_dsdlc.git
+      revision: 431170fa4bfe2212b516b8f33bdc796267907f1c
+      path: lib/dronecan_dsdlc
+

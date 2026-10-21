@@ -1,0 +1,5 @@
+# Python dependencies for DSDL code generation (dronecan_dsdlc) at build time.
+# Pinned to the versions the generator was tested with.
+empy==4.2.1
+pexpect==4.9.0
+dronecan==1.0.27

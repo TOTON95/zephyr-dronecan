@@ -1,0 +1,154 @@
+# zephyr-dronecan DroneCAN protocol stack configuration file
+
+# Copyright (c) 2026 3DR, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+config DRONECAN
+	bool "DroneCAN support"
+	depends on CAN
+	help
+	 Enables the DroneCAN (libcanard) support.
+
+if DRONECAN
+
+module = DRONECAN
+module-str = dronecan
+source "subsys/logging/Kconfig.template.log_config"
+
+menu "Protocol"
+
+config DRONECAN_NODE_TABLE
+	bool "Node discovery table"
+	help
+	  Track nodes seen on the bus, this is built from received NodeStatus msgs.
+
+config DRONECAN_DNIA_SERVER
+	bool "Dynamic Node ID allocation server"
+	select DRONECAN_NODE_TABLE
+	help
+	  Act as the DNIA allocator (like a flight controller).
+
+config DRONECAN_DNIA_CLIENT
+	bool "Dynamic Node ID allocation client"
+	select HWINFO
+	help
+	  Request a node ID from an allocator, using the hardware unique ID (like a peripheral).
+
+# TODO
+# config DRONECAN_SERVICE_GET_NODE_INFO
+# 	bool "uavcan.protocol.GetNodeInfo service"
+# 
+# config DRONECAN_SERVICE_RESTART_NODE
+# 	bool "uavcan.protocol.RestartNode service"
+# 
+# config DRONECAN_SERVICE_PARAM
+# 	bool "uavcan.protocol.param services (GetSet, ExecuteOpcode)"
+# 
+# config DRONECAN_PERIPHERAL
+# 	bool "Peripheral node role"
+# 	select DRONECAN_DNIA_CLIENT
+# 	select DRONECAN_SERVICE_GET_NODE_INFO
+# 	select DRONECAN_SERVICE_RESTART_NODE
+# 	select DRONECAN_SERVICE_PARAM
+# 	help
+# 	  Node that gets its ID (0 initially) from a flight controller (DNIA) and answers the services.
+
+endmenu # Protocol
+
+menu "Resources"
+
+config DRONECAN_RX_STACK_SIZE
+	int "Rx thread stack size"
+	default 4096
+	help
+	  About 4096 B was needed for ~60 message types enabled. Adjust accordingly.
+
+config DRONECAN_HOUSEKEEPING_STACK_SIZE
+	int "NodeStatus / housekeeping thread stack size"
+	default 2048
+
+config DRONECAN_THREAD_PRIORITY
+	int "Thread priority"
+	default 10 #TBD
+
+config DRONECAN_RX_MSGQ_SIZE
+	int "RX frame queue depth"
+	default 32
+
+config DRONECAN_MEM_BLOCKS
+	int "libcanard memory pool blocks"
+	default 64
+	help
+	  Pool is __aligned(8); unaligned arenas fault on Cortex-M7
+
+config DRONECAN_TX_TIMEOUT_MS
+	int "CAN send timeout (ms)"
+	default 10
+
+config DRONECAN_NODE_TIMEOUT_MS
+	int "Node considered stale after (ms)"
+	default 3000
+	depends on DRONECAN_NODE_TABLE
+
+config DRONECAN_TX_DRAIN_MAX
+	int "Max frames drained per pass"
+	default 16
+
+# TODO
+# config DRONECAN_MULTI_IFACE
+# 	bool "Redundant CAN interfaces (CANARD_MULTI_IFACE)"
+
+endmenu # Resources
+
+menu "DSDL generation"
+
+config DRONECAN_DSDL_UAVCAN
+	bool "uavcan"
+	default y
+
+config DRONECAN_DSDL_DRONECAN
+	bool "dronecan"
+	default y
+
+config DRONECAN_DSDL_ARDUPILOT
+	bool "ardupilot"
+	default y
+
+endmenu # DSDL generation
+
+rsource "Kconfig.messages"
+
+menuconfig DRONECAN_SHELL
+	bool "Shell commands"
+	depends on SHELL
+	help
+	  All shell code lives in its own source file, the core never touches the shell
+
+if DRONECAN_SHELL
+
+config DRONECAN_SHELL_MONITOR
+	bool "dc monitor"
+	default y
+	help
+	  Displays the latest message sorted by message type
+
+config DRONECAN_SHELL_SUBSCRIBE
+	bool "dc subscribe"
+	default y
+	help
+	  Suscribe to a message type and display obtained data
+
+config DRONECAN_SHELL_PUBLISH
+	bool "dc publish"
+	default y
+	help
+	  Publish a message type to the CAN Bus
+
+# config DRONECAN_SHELL_PERIPHERAL
+# 	bool "dc peripheral"
+# 	depends on DRONECAN_DNIA_CLIENT
+
+endif # DRONECAN_SHELL
+
+
+endif # DRONECAN

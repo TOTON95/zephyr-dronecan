@@ -1,0 +1,12 @@
+name: zephyr-dronecan
+build:
+  kconfig: Kconfig
+  cmake: .
+samples:
+  - samples
+tests:
+  - tests
+package-managers:
+  pip:
+    requirement-files:
+      - requirements.txt
