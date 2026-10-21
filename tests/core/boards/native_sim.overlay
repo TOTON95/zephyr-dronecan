@@ -1,0 +1,16 @@
+// Both nodes share the loopback controller and hear each other
+/ {
+	dronecan0: dronecan0 {
+		compatible = "zephyr,dronecan";
+		can-buses = <&can_loopback0>;
+		node-id = <42>;
+		status = "okay";
+	};
+
+	dronecan1: dronecan1 {
+		compatible = "zephyr,dronecan";
+		can-buses = <&can_loopback0>;
+		node-id = <43>;
+		status = "okay";
+	};
+};
