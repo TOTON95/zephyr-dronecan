@@ -1,0 +1,16 @@
+/ {
+	chosen {
+		zephyr,canbus	= &fdcan1;
+	};
+
+	dronecan0: dronecan {
+		compatible = "zephyr,dronecan";
+		can-buses = <&fdcan1>;
+		node-id = <42>;
+		status = "okay";
+	};
+};
+
+&fdcan1 {
+	bitrate = <1000000>;
+};

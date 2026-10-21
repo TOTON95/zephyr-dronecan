@@ -64,6 +64,57 @@ or install only this module's packages with `pip install -r requirements.txt`.
 
 ## Configuration
 
+### Devicetree
+
+A DroneCAN node is described in devicetree and attached to a CAN controller. This is the proposed
+definition (the binding is not in the repository yet and may change):
+
+```dts
+dronecan0: dronecan {
+	compatible = "zephyr,dronecan";
+	can-buses = <&fdcan1>;
+	node-id = <42>;
+	mem-blocks = <64>;
+	status = "okay";
+};
+```
+
+| Property | Description |
+| --- | --- |
+| `can-buses` | CAN controller used by the node. One controller is supported for now. |
+| `node-id` | Static node ID (1-127), or 0 to stay anonymous until an ID is allocated. |
+| `mem-blocks` | libcanard memory pool size in blocks (default 64). |
+
+The bus speed is not a property of the DroneCAN node. It is set on the CAN controller with the
+standard `bitrate` property, and DroneCAN normally uses 1 Mbit/s.
+
+#### 3DR Control N1
+
+The board already enables `fdcan1` (pins and clocks are set in the board devicetree). Set the
+bitrate in your overlay and add the node:
+
+```dts
+&fdcan1 {
+	bitrate = <1000000>;
+};
+
+/ {
+	dronecan0: dronecan {
+		compatible = "zephyr,dronecan";
+		can-buses = <&fdcan1>;
+		node-id = <42>;
+		status = "okay";
+	};
+};
+```
+
+Then enable the module in `prj.conf`:
+
+```ini
+CONFIG_CAN=y
+CONFIG_DRONECAN=y
+```
+
 ## Samples
 
 ## Tests
