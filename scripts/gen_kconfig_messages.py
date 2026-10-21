@@ -30,10 +30,6 @@ def symbol(full_name):
     return "DRONECAN_MSG_" + full_name.replace(".", "_").upper()
 
 
-def c_macro(full_name):
-    return full_name.replace(".", "_").upper()
-
-
 def load(dsdl_dir):
     # One call: the namespaces refer to each other
     types = dronecan.dsdl.parse_namespaces([os.path.join(dsdl_dir, ns) for ns in NAMESPACES])
@@ -70,6 +66,7 @@ def write_kconfig(msgs, path):
 
 
 def write_table(msgs, path):
+    # Same values as in the dronecan_dsdlc headers
     out = [
         "/* " + HEADER + " */",
         "",
@@ -77,16 +74,14 @@ def write_table(msgs, path):
         "",
         '#include "dronecan_msg_table.h"',
         "",
+        "const struct dronecan_msg_entry dronecan_msg_table[] = {",
     ]
     for t in msgs:
+        max_size = (t.get_max_bitlen() + 7) // 8
         out.append(f"#ifdef CONFIG_{symbol(t.full_name)}")
-        out.append(f"#include <{t.full_name}.h>")
-        out.append("#endif")
-    out += ["", "const struct dronecan_msg_entry dronecan_msg_table[] = {"]
-    for t in msgs:
-        m = c_macro(t.full_name)
-        out.append(f"#ifdef CONFIG_{symbol(t.full_name)}")
-        out.append(f'\t{{"{t.full_name}", {{{m}_ID, {m}_SIGNATURE, {m}_MAX_SIZE}}}},')
+        out.append(
+            f'\t{{"{t.full_name}", {{{t.default_dtid}, 0x{t.get_data_type_signature():X}ULL, {max_size}}}}},'
+        )
         out.append("#endif")
     out += [
         "};",
