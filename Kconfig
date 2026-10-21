@@ -139,6 +139,11 @@ config DRONECAN_DNIA_TIMEOUT_MS
 	default 500
 	depends on DRONECAN_DNIA_SERVER
 
+config DRONECAN_DNIA_CLIENT_STAGE_TIMEOUT_MS
+	int "DNIA client: wait for the allocator's answer to a request (ms)"
+	default 500
+	depends on DRONECAN_DNIA_CLIENT
+
 config DRONECAN_DNIA_MAX_GRANTS
 	int "Node IDs remembered by the allocation server"
 	default 16
@@ -223,9 +228,12 @@ config DRONECAN_SHELL_MONITOR_TYPES
 	help
 	  One subscription is used per message type.
 
-# config DRONECAN_SHELL_PERIPHERAL
-# 	bool "dc peripheral"
-# 	depends on DRONECAN_DNIA_CLIENT
+config DRONECAN_SHELL_PERIPHERAL
+	bool "dc peripheral"
+	depends on DRONECAN_DNIA_CLIENT
+	default y
+	help
+	  Ask an allocator for the node ID of an anonymous node
 
 endif # DRONECAN_SHELL
 

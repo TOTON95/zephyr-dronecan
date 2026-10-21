@@ -130,8 +130,9 @@ int dronecan_unsubscribe(const struct device *dev, struct dronecan_subscription 
 int dronecan_get_node(const struct device *dev, uint8_t id, struct dronecan_node_entry *out);
 void dronecan_get_stats(const struct device *dev, struct dronecan_stats *out);
 
-// DNIA Request, for clients
-// int dronecan_dnia_request(const struct device *dev, k_timeout_t timeout);
+// Blocks until an allocator grants this anonymous node an ID, and uses it.
+// Returns 0, -EALREADY (has an ID), -ETIMEDOUT or another -errno. Not for ISRs.
+int dronecan_dnia_request(const struct device *dev, k_timeout_t timeout);
 
 #ifdef __cplusplus
 }

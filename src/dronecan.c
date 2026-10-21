@@ -12,9 +12,11 @@
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/can.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/slist.h>
 
 #include <canard.h>
@@ -45,10 +47,13 @@ struct dronecan_pub {
 	uint8_t transfer_id;
 };
 
+#if defined(CONFIG_DRONECAN_DNIA_SERVER) || defined(CONFIG_DRONECAN_DNIA_CLIENT)
+#define DNIA_UID_LEN 16
+#endif
+
 #ifdef CONFIG_DRONECAN_DNIA_SERVER
 #define DNIA_ID_MIN 10
 #define DNIA_ID_MAX 125
-#define DNIA_UID_LEN 16
 
 struct dnia_grant {
 	uint8_t uid[DNIA_UID_LEN];
@@ -64,6 +69,17 @@ struct dnia {
 	struct dnia_grant grants[CONFIG_DRONECAN_DNIA_MAX_GRANTS];
 	uint8_t num_grants;
 	uint8_t next_grant;
+};
+#endif
+
+#ifdef CONFIG_DRONECAN_DNIA_CLIENT
+struct dnia_client {
+	atomic_t busy;
+	bool active; // canard_mtx: a request is waiting for answers
+	uint8_t uid[DNIA_UID_LEN];
+	uint8_t echoed; // unique ID bytes the allocator has repeated back
+	uint8_t granted;
+	struct k_sem answer;
 };
 #endif
 
@@ -108,6 +124,9 @@ struct dronecan_data {
 	bool rx_ready;
 #ifdef CONFIG_DRONECAN_DNIA_SERVER
 	struct dnia dnia; // canard_mtx
+#endif
+#ifdef CONFIG_DRONECAN_DNIA_CLIENT
+	struct dnia_client dnia_cl;
 #endif
 
 	struct dronecan_stats stats;
@@ -288,6 +307,32 @@ static void dnia_handle(struct dronecan_data *data, CanardRxTransfer *t)
 }
 #endif
 
+#ifdef CONFIG_DRONECAN_DNIA_CLIENT
+// Answers to our request come from the allocator. Call with canard_mtx held.
+static void dnia_client_handle(struct dronecan_data *data, const CanardRxTransfer *t)
+{
+	struct uavcan_protocol_dynamic_node_id_Allocation rsp;
+	struct dnia_client *c = &data->dnia_cl;
+
+	if (!c->active || t->source_node_id == DRONECAN_NODE_ID_ANON ||
+	    uavcan_protocol_dynamic_node_id_Allocation_decode(t, &rsp) ||
+	    rsp.unique_id.len > DNIA_UID_LEN ||
+	    memcmp(rsp.unique_id.data, c->uid, rsp.unique_id.len) != 0) {
+		return; // not for us
+	}
+
+	if (rsp.node_id != 0) {
+		if (rsp.unique_id.len != DNIA_UID_LEN) {
+			return;
+		}
+		c->granted = rsp.node_id;
+	} else {
+		c->echoed = rsp.unique_id.len;
+	}
+	k_sem_give(&c->answer);
+}
+#endif
+
 static bool dronecan_should_accept(const CanardInstance *ins, uint64_t *out_signature,
 				   uint16_t data_type_id, CanardTransferType transfer_type,
 				   uint8_t source_node_id)
@@ -298,7 +343,7 @@ static bool dronecan_should_accept(const CanardInstance *ins, uint64_t *out_sign
 		return false;
 	}
 
-#ifdef CONFIG_DRONECAN_DNIA_SERVER
+#if defined(CONFIG_DRONECAN_DNIA_SERVER) || defined(CONFIG_DRONECAN_DNIA_CLIENT)
 	if (data_type_id == UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID) {
 		*out_signature = UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_SIGNATURE;
 		return true;
@@ -355,6 +400,13 @@ static void dronecan_on_reception(CanardInstance *ins, CanardRxTransfer *transfe
 #ifdef CONFIG_DRONECAN_DNIA_SERVER
 	case UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID:
 		dnia_handle(data, transfer);
+#ifdef CONFIG_DRONECAN_DNIA_CLIENT
+		dnia_client_handle(data, transfer);
+#endif
+		break;
+#elif defined(CONFIG_DRONECAN_DNIA_CLIENT)
+	case UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID:
+		dnia_client_handle(data, transfer);
 		break;
 #endif
 	default:
@@ -618,6 +670,9 @@ static int dronecan_init(const struct device *dev)
 	k_condvar_init(&data->sub_cv);
 	sys_slist_init(&data->subs);
 	k_sem_init(&data->tx_done, 0, 1);
+#ifdef CONFIG_DRONECAN_DNIA_CLIENT
+	k_sem_init(&data->dnia_cl.answer, 0, 1);
+#endif
 
 	data->health = DRONECAN_HEALTH_OK;
 	data->mode = DRONECAN_MODE_INITIALIZATION;
@@ -709,15 +764,18 @@ int dronecan_start(const struct device *dev)
 #ifdef CONFIG_DRONECAN_DNIA_SERVER
 	memset(&data->dnia, 0, sizeof(data->dnia));
 #endif
+#ifdef CONFIG_DRONECAN_DNIA_CLIENT
+	data->dnia_cl.active = false;
+#endif
 	data->mode = DRONECAN_MODE_OPERATIONAL;
 	k_mutex_unlock(&data->canard_mtx);
 
 	atomic_set(&data->started, 1);
 
 	if (cfg->node_id == DRONECAN_NODE_ID_ANON) {
-		LOG_WRN("%s: node ID 0 (anonymous): no NodeStatus is sent and no node ID is "
-			"requested, the allocation client is not implemented yet",
-			dev->name);
+		LOG_WRN("%s: node ID 0 (anonymous): no NodeStatus is sent until the node has an ID%s",
+			dev->name,
+			IS_ENABLED(CONFIG_DRONECAN_DNIA_CLIENT) ? ", call dronecan_dnia_request()" : "");
 	}
 	ret = 0;
 out:
@@ -870,6 +928,147 @@ int dronecan_broadcast(const struct device *dev, const struct dronecan_msg_desc 
 	k_work_submit_to_queue(&data->tx_workq, &data->tx_work);
 	return 0; // queued: transmission errors show up in the statistics
 }
+
+// DNIA client
+
+#ifdef CONFIG_DRONECAN_DNIA_CLIENT
+#define DNIA_PART_LEN 6 // unique ID bytes per request: anonymous transfers carry at most 7 bytes
+
+static const struct dronecan_msg_desc dnia_desc = {
+	.id = UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_ID,
+	.signature = UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_SIGNATURE,
+	.max_size = UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_MAX_SIZE,
+};
+
+static int dnia_send_part(const struct device *dev, const uint8_t *uid, uint8_t sent, uint8_t len)
+{
+	struct uavcan_protocol_dynamic_node_id_Allocation req = {0};
+	uint8_t buf[UAVCAN_PROTOCOL_DYNAMIC_NODE_ID_ALLOCATION_MAX_SIZE];
+
+	req.first_part_of_unique_id = sent == 0;
+	req.unique_id.len = len;
+	memcpy(req.unique_id.data, uid + sent, len);
+	return dronecan_broadcast(dev, &dnia_desc, DRONECAN_PRIORITY_LOW, buf,
+				  uavcan_protocol_dynamic_node_id_Allocation_encode(&req, buf));
+}
+
+// One handshake: the unique ID goes out in parts, each of them repeated back by the allocator.
+static int dnia_attempt(const struct device *dev, const uint8_t *uid)
+{
+	struct dronecan_data *data = dev->data;
+	struct dnia_client *c = &data->dnia_cl;
+	uint8_t sent = 0;
+
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
+	memcpy(c->uid, uid, DNIA_UID_LEN);
+	c->echoed = 0;
+	c->granted = 0;
+	c->active = true;
+	k_sem_reset(&c->answer);
+	k_mutex_unlock(&data->canard_mtx);
+
+	while (sent < DNIA_UID_LEN) {
+		uint8_t len = MIN(DNIA_PART_LEN, DNIA_UID_LEN - sent);
+		bool last = sent + len == DNIA_UID_LEN;
+		k_timepoint_t end = sys_timepoint_calc(K_MSEC(CONFIG_DRONECAN_DNIA_CLIENT_STAGE_TIMEOUT_MS));
+		int ret = dnia_send_part(dev, uid, sent, len);
+
+		if (ret != 0) {
+			return ret;
+		}
+
+		// The allocator repeats the bytes it has, then the last part gets the node ID
+		while (true) {
+			uint8_t echoed, granted;
+
+			if (k_sem_take(&c->answer, sys_timepoint_timeout(end)) != 0) {
+				return -ETIMEDOUT;
+			}
+			if (!atomic_get(&data->started)) {
+				return -ECANCELED;
+			}
+			k_mutex_lock(&data->canard_mtx, K_FOREVER);
+			echoed = c->echoed;
+			granted = c->granted;
+			k_mutex_unlock(&data->canard_mtx);
+
+			if (granted != 0) {
+				return granted;
+			}
+			if (!last && echoed == sent + len) {
+				break;
+			}
+		}
+		sent += len;
+	}
+	return -ETIMEDOUT;
+}
+
+int dronecan_dnia_request(const struct device *dev, k_timeout_t timeout)
+{
+	struct dronecan_data *data = dev->data;
+	struct dnia_client *c = &data->dnia_cl;
+	uint8_t uid[DNIA_UID_LEN] = {0};
+	k_timepoint_t end = sys_timepoint_calc(timeout);
+	ssize_t n;
+	int ret;
+
+	if (!atomic_get(&data->started)) {
+		return -ENETDOWN;
+	}
+	if (dronecan_get_node_id(dev) != DRONECAN_NODE_ID_ANON) {
+		return -EALREADY;
+	}
+	if (!atomic_cas(&c->busy, 0, 1)) {
+		return -EBUSY;
+	}
+
+	n = hwinfo_get_device_id(uid, sizeof(uid));
+	if (n <= 0) {
+		ret = n < 0 ? (int)n : -ENOTSUP;
+		goto out;
+	}
+
+	while (true) {
+		ret = dnia_attempt(dev, uid);
+		if (ret > 0) {
+			k_mutex_lock(&data->canard_mtx, K_FOREVER);
+			canardSetLocalNodeID(&data->canard, ret);
+			k_mutex_unlock(&data->canard_mtx);
+			LOG_INF("%s: node ID %d granted", dev->name, ret);
+			ret = 0;
+			break;
+		}
+		if (ret != -ETIMEDOUT) {
+			break;
+		}
+		if (sys_timepoint_expired(end)) {
+			break;
+		}
+
+		// Two nodes starting together would repeat the same collision: wait 0.6-1 s, a bit
+		// different on each node. The unique ID is mixed in, so no random generator is needed.
+		k_sleep(K_MSEC(600 + (k_cycle_get_32() ^ sys_get_be32(uid)) % 401));
+		if (!atomic_get(&data->started)) {
+			ret = -ECANCELED;
+			break;
+		}
+	}
+out:
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
+	c->active = false;
+	k_mutex_unlock(&data->canard_mtx);
+	atomic_clear(&c->busy);
+	return ret;
+}
+#else
+int dronecan_dnia_request(const struct device *dev, k_timeout_t timeout)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(timeout);
+	return -ENOTSUP;
+}
+#endif
 
 // Queries
 

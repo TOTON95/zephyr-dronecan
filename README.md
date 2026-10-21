@@ -142,6 +142,7 @@ devicetree device name and `<msg>` the full DSDL name of an enabled message.
 | `dc subscribe <dev> <msg>` | Print each received message as hex bytes |
 | `dc unsubscribe <dev> <msg>` | Stop printing it |
 | `dc monitor <dev> on\|off\|show` | Count the messages of every enabled type |
+| `dc peripheral <dev> [timeout s]` | Ask an allocator for a node ID (the node needs `node-id = <0>`; needs `CONFIG_DRONECAN_DNIA_CLIENT`) |
 | `dc publish <dev> <msg> <hex> [-r <hz>]` | Broadcast raw bytes, once or repeated at a rate |
 | `dc unpublish <dev> <msg>` | Stop a repeated message |
 
@@ -161,11 +162,24 @@ west build -b control_n1 samples/dronecan
 
 Starts a node and leaves the `dc` shell commands to drive it. On the 3DR Control N1 the shell runs
 on a USB CDC ACM port and the console is turned off, so a USB cable is enough. On `native_sim` the
-node sits on the CAN loopback controller.
+node sits on the CAN loopback controller. To try `dc peripheral`, set `node-id = <0>` in the
+overlay and connect an allocator.
 
 ```sh
 west build -b native_sim samples/dronecan_shell
 west build -b control_n1 samples/dronecan_shell
+```
+
+### `samples/dronecan_peripheral`
+
+An anonymous node (node ID 0) that asks an allocator on the bus for its node ID with
+`dronecan_dnia_request()`, then reports its statistics. On the 3DR Control N1 the allocator is a
+flight controller or the DroneCAN GUI Tool, or another board running `samples/dronecan` (it enables
+the allocation server). On `native_sim` a second node plays the allocator.
+
+```sh
+west build -b native_sim samples/dronecan_peripheral
+west build -b control_n1 samples/dronecan_peripheral
 ```
 
 If the DSDL projects are not in the default location, point CMake at them with

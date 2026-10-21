@@ -424,6 +424,50 @@ static int cmd_monitor(const struct shell *sh, size_t argc, char **argv)
 }
 #endif // CONFIG_DRONECAN_SHELL_MONITOR
 
+#ifdef CONFIG_DRONECAN_SHELL_PERIPHERAL
+// Blocks the shell until the node has an ID or the time is up
+static int cmd_peripheral(const struct shell *sh, size_t argc, char **argv)
+{
+	const struct device *dev = find_dev(sh, argv[1]);
+	unsigned long timeout_s = 10;
+	int ret;
+
+	if (dev == NULL) {
+		return -ENODEV;
+	}
+	if (argc > 2) {
+		char *end;
+
+		timeout_s = strtoul(argv[2], &end, 10);
+		if (*end != '\0' || timeout_s < 1 || timeout_s > 300) {
+			shell_error(sh, "timeout must be 1 to 300 seconds");
+			return -EINVAL;
+		}
+	}
+
+	shell_print(sh, "asking for a node ID, up to %lu s", timeout_s);
+	ret = dronecan_dnia_request(dev, K_SECONDS(timeout_s));
+	switch (ret) {
+	case 0:
+		shell_print(sh, "node ID %u granted", dronecan_get_node_id(dev));
+		break;
+	case -EALREADY:
+		shell_error(sh, "the node already has ID %u", dronecan_get_node_id(dev));
+		break;
+	case -ETIMEDOUT:
+		shell_error(sh, "no allocator answered");
+		break;
+	case -ENETDOWN:
+		shell_error(sh, "%s is not started", dev->name);
+		break;
+	default:
+		shell_error(sh, "request failed: %d", ret);
+		break;
+	}
+	return ret;
+}
+#endif // CONFIG_DRONECAN_SHELL_PERIPHERAL
+
 SHELL_STATIC_SUBCMD_SET_CREATE(dc_cmds,
 	SHELL_CMD_ARG(list, NULL, "List the DroneCAN devices", cmd_list, 1, 0),
 	SHELL_CMD_ARG(msgs, NULL, "List the enabled messages", cmd_msgs, 1, 0),
@@ -440,6 +484,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(dc_cmds,
 		      "Usage: dc subscribe <device> <message>", cmd_subscribe, 3, 0),
 	SHELL_CMD_ARG(unsubscribe, NULL, "Stop printing a message\n"
 		      "Usage: dc unsubscribe <device> <message>", cmd_unsubscribe, 3, 0),
+#endif
+#ifdef CONFIG_DRONECAN_SHELL_PERIPHERAL
+	SHELL_CMD_ARG(peripheral, NULL, "Ask an allocator for the node ID of an anonymous node\n"
+		      "Usage: dc peripheral <device> [timeout s]", cmd_peripheral, 2, 1),
 #endif
 #ifdef CONFIG_DRONECAN_SHELL_PUBLISH
 	SHELL_CMD_ARG(publish, NULL, "Broadcast a message from hex bytes, once or repeated\n"
