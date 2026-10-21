@@ -1,0 +1,25 @@
+// Shell on a USB CDC ACM port (the board console is UART7)
+#include <../boards/common/usb/cdc_acm_serial.dtsi>
+
+/ {
+	chosen {
+		zephyr,canbus	= &fdcan1;
+	};
+
+	dronecan0: dronecan {
+		compatible = "zephyr,dronecan";
+		can-buses = <&fdcan1>;
+		node-id = <42>;
+		status = "okay";
+	};
+};
+
+&fdcan1 {
+	bitrate = <1000000>;
+};
+
+// The CDC ACM UART discards output while its USB packet is full.
+// hw-flow-control makes it wait for a free packet, so no console output is lost.
+&board_cdc_acm_uart {
+	hw-flow-control;
+};

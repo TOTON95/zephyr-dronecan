@@ -156,6 +156,17 @@ west build -b native_sim samples/dronecan
 west build -b control_n1 samples/dronecan
 ```
 
+### `samples/dronecan_shell`
+
+Starts a node and leaves the `dc` shell commands to drive it. On the 3DR Control N1 the shell runs
+on a USB CDC ACM port and the console is turned off, so a USB cable is enough. On `native_sim` the
+node sits on the CAN loopback controller.
+
+```sh
+west build -b native_sim samples/dronecan_shell
+west build -b control_n1 samples/dronecan_shell
+```
+
 If the DSDL projects are not in the default location, point CMake at them with
 `-DDRONECAN_DSDL_DIR=<path>` and `-DDRONECAN_DSDLC_DIR=<path>`.
 
