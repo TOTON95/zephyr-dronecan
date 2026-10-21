@@ -187,6 +187,22 @@ If the DSDL projects are not in the default location, point CMake at them with
 
 ## Tests
 
+The tests are [ztest](https://docs.zephyrproject.org/latest/develop/test/ztest.html) suites that
+run on `native_sim`, with the nodes on the CAN loopback controller:
+
+```sh
+west twister -T tests -p native_sim
+```
+
+| Suite | Covers |
+| --- | --- |
+| `tests/core` | Start and stop, publishing, subscriptions, multi-frame delivery, NodeStatus and the node table, statistics |
+| `tests/dnia` | The allocation server and the allocation client |
+
+Only one node on a bus should be an allocator. The allocation server option applies to the whole
+image, so every node with an ID in the `tests/dnia` image answers requests: the suite keeps a single
+node with an ID.
+
 ## Repository layout
 
 ## Compatibility
