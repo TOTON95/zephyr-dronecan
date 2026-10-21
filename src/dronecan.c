@@ -14,6 +14,7 @@
 #include <zephyr/drivers/can.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/slist.h>
 
 #include <canard.h>
@@ -30,15 +31,26 @@ struct dronecan_config {
 	size_t arena_size;
 	struct k_msgq *rx_msgq;
 	k_thread_stack_t *rx_stack;
+	size_t rx_stack_size;
+	k_thread_stack_t *tx_stack;
+	size_t tx_stack_size;
 	k_thread_stack_t *hk_stack;
 };
 
+struct dronecan_pub {
+	uint16_t id;
+	uint8_t transfer_id;
+};
+
 /*
- * Lock order: canard_mtx -> table_mtx, canard_mtx -> sub_mtx.
+ * Lock order: lifecycle_mtx -> canard_mtx -> table_mtx, canard_mtx -> sub_mtx.
  * Never call a subscription callback or take canard_mtx while holding sub_mtx.
+ * Never log or call can_send() with canard_mtx held.
  */
 struct dronecan_data {
+	const struct device *dev;
 	CanardInstance canard;
+	struct k_mutex lifecycle_mtx;
 	struct k_mutex canard_mtx;
 	struct k_mutex table_mtx;
 	struct k_mutex sub_mtx;
@@ -47,13 +59,20 @@ struct dronecan_data {
 	struct dronecan_subscription *in_flight; // callback running, guarded by sub_mtx
 
 	struct k_thread rx_thread;
+	struct k_work_q tx_workq; // one sender, so frames leave in queue order
+	struct k_work tx_work;
 	struct k_thread hk_thread;
 
-	bool started;
-	uint8_t node_id;
+	atomic_t started;
+	int rx_filter_id;
+	bool owns_controller; // we called can_start(), so we may call can_stop()
+
 	uint8_t health;
 	uint8_t mode;
 	uint16_t vendor_status;
+
+	struct dronecan_pub pub[CONFIG_DRONECAN_MAX_PUBLISHED_TYPES];
+	uint8_t num_pub;
 
 	struct dronecan_stats stats;
 #ifdef CONFIG_DRONECAN_NODE_TABLE
@@ -61,34 +80,273 @@ struct dronecan_data {
 #endif
 };
 
+// libcanard callbacks
+
+static bool dronecan_should_accept(const CanardInstance *ins, uint64_t *out_signature,
+				   uint16_t data_type_id, CanardTransferType transfer_type,
+				   uint8_t source_node_id)
+{
+	ARG_UNUSED(ins);
+	ARG_UNUSED(out_signature);
+	ARG_UNUSED(data_type_id);
+	ARG_UNUSED(transfer_type);
+	ARG_UNUSED(source_node_id);
+
+	return false;
+}
+
+static void dronecan_on_reception(CanardInstance *ins, CanardRxTransfer *transfer)
+{
+	ARG_UNUSED(ins);
+	ARG_UNUSED(transfer);
+}
+
+// TX path
+
+// Move queued libcanard frames into Zephyr frames. Call with canard_mtx held.
+static int drain_tx(struct dronecan_data *data, struct can_frame *out, int max)
+{
+	int n = 0;
+
+	while (n < max) {
+		const CanardCANFrame *cf = canardPeekTxQueue(&data->canard);
+
+		if (cf == NULL) {
+			break;
+		}
+		out[n] = (struct can_frame){
+			.id = cf->id & CANARD_CAN_EXT_ID_MASK,
+			.flags = CAN_FRAME_IDE,
+			.dlc = can_bytes_to_dlc(cf->data_len),
+		};
+		memcpy(out[n].data, cf->data, cf->data_len);
+		canardPopTxQueue(&data->canard);
+		n++;
+	}
+	return n;
+}
+
+static void tx_work_handler(struct k_work *work)
+{
+	struct dronecan_data *data = CONTAINER_OF(work, struct dronecan_data, tx_work);
+	const struct dronecan_config *cfg = data->dev->config;
+	struct can_frame frames[CONFIG_DRONECAN_TX_DRAIN_MAX];
+	int n;
+
+	do {
+		k_mutex_lock(&data->canard_mtx, K_FOREVER);
+		n = drain_tx(data, frames, ARRAY_SIZE(frames));
+		k_mutex_unlock(&data->canard_mtx);
+
+		for (int i = 0; i < n; i++) {
+			int ret = can_send(cfg->can_bus[0], &frames[i],
+					   K_MSEC(CONFIG_DRONECAN_TX_TIMEOUT_MS), NULL, NULL);
+
+			if (ret == 0) {
+				data->stats.tx++;
+			} else {
+				data->stats.tx_err++;
+				LOG_DBG("can_send failed: %d", ret);
+			}
+		}
+	} while (n == ARRAY_SIZE(frames));
+}
+
+// RX path
+
+static void rx_thread_fn(void *p1, void *p2, void *p3)
+{
+	const struct device *dev = p1;
+	const struct dronecan_config *cfg = dev->config;
+	struct dronecan_data *data = dev->data;
+	struct can_frame frame;
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (true) {
+		// Fails (-ENOMSG) when dronecan_stop() purges the queue while we wait.
+		if (k_msgq_get(cfg->rx_msgq, &frame, K_FOREVER) != 0) {
+			continue;
+		}
+
+		if (!atomic_get(&data->started) || (frame.flags & CAN_FRAME_RTR) != 0U) {
+			continue;
+		}
+
+		CanardCANFrame cf = {
+			.id = frame.id | CANARD_CAN_FRAME_EFF,
+			.data_len = can_dlc_to_bytes(frame.dlc),
+			.iface_id = 0, // TODO: interface index when multi-bus lands
+		};
+
+		memcpy(cf.data, frame.data, cf.data_len);
+		LOG_DBG("rx id=0x%08x len=%u tail=0x%02x", frame.id, cf.data_len,
+			cf.data_len > 0 ? cf.data[cf.data_len - 1] : 0);
+
+		k_mutex_lock(&data->canard_mtx, K_FOREVER);
+		canardHandleRxFrame(&data->canard, &cf, k_uptime_get() * 1000ULL);
+		bool tx_pending = canardPeekTxQueue(&data->canard) != NULL;
+
+		k_mutex_unlock(&data->canard_mtx);
+
+		if (tx_pending) {
+			k_work_submit_to_queue(&data->tx_workq, &data->tx_work);
+		}
+	}
+}
+
+// Init
+
 static int dronecan_init(const struct device *dev)
 {
 	const struct dronecan_config *cfg = dev->config;
 	struct dronecan_data *data = dev->data;
+	const struct k_work_queue_config qcfg = {.name = "dronecan_tx"};
 
+	data->dev = dev;
+
+	k_mutex_init(&data->lifecycle_mtx);
 	k_mutex_init(&data->canard_mtx);
 	k_mutex_init(&data->table_mtx);
 	k_mutex_init(&data->sub_mtx);
 	k_condvar_init(&data->sub_cv);
 	sys_slist_init(&data->subs);
 
-	data->node_id = cfg->node_id;
 	data->health = DRONECAN_HEALTH_OK;
 	data->mode = DRONECAN_MODE_INITIALIZATION;
 
-	LOG_DBG("%s: node %u on %s, arena %zu bytes", dev->name, data->node_id,
+	// The threads live as long as the device: start/stop only gate the traffic.
+	k_work_init(&data->tx_work, tx_work_handler);
+	k_work_queue_init(&data->tx_workq);
+	k_work_queue_start(&data->tx_workq, cfg->tx_stack, cfg->tx_stack_size,
+			   CONFIG_DRONECAN_THREAD_PRIORITY, &qcfg);
+
+	k_thread_create(&data->rx_thread, cfg->rx_stack, cfg->rx_stack_size, rx_thread_fn,
+			(void *)dev, NULL, NULL, CONFIG_DRONECAN_THREAD_PRIORITY, 0, K_NO_WAIT);
+	k_thread_name_set(&data->rx_thread, "dronecan_rx");
+
+	LOG_DBG("%s: node %u on %s, arena %zu bytes", dev->name, cfg->node_id,
 		cfg->can_bus[0]->name, cfg->arena_size);
 
 	return 0;
 }
 
+// Lifecycle
+
+int dronecan_start(const struct device *dev)
+{
+	const struct dronecan_config *cfg = dev->config;
+	struct dronecan_data *data = dev->data;
+	const struct device *can = cfg->can_bus[0];
+	static const struct can_filter filter = {.id = 0, .mask = 0, .flags = CAN_FILTER_IDE};
+	int ret;
+
+	k_mutex_lock(&data->lifecycle_mtx, K_FOREVER);
+
+	if (atomic_get(&data->started)) {
+		ret = -EALREADY;
+		goto out;
+	}
+	if (!device_is_ready(can)) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	// The bitrate comes from the controller's devicetree node, classic CAN only.
+	ret = can_set_mode(can, IS_ENABLED(CONFIG_DRONECAN_LOOPBACK_MODE) ? CAN_MODE_LOOPBACK
+									 : CAN_MODE_NORMAL);
+	if (ret != 0 && ret != -EBUSY) { // -EBUSY: someone else already started it
+		LOG_ERR("can_set_mode failed: %d", ret);
+		goto out;
+	}
+
+	ret = can_add_rx_filter_msgq(can, cfg->rx_msgq, &filter);
+	if (ret < 0) {
+		LOG_ERR("can_add_rx_filter_msgq failed: %d", ret);
+		goto out;
+	}
+	data->rx_filter_id = ret;
+
+	ret = can_start(can);
+	if (ret == 0) {
+		data->owns_controller = true;
+	} else if (ret == -EALREADY) {
+		data->owns_controller = false;
+	} else {
+		LOG_ERR("can_start failed: %d", ret);
+		can_remove_rx_filter(can, data->rx_filter_id);
+		goto out;
+	}
+
+	memset(&data->stats, 0, sizeof(data->stats));
+
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
+	canardInit(&data->canard, cfg->arena, cfg->arena_size, dronecan_on_reception,
+		   dronecan_should_accept, data);
+	if (cfg->node_id != DRONECAN_NODE_ID_ANON) {
+		canardSetLocalNodeID(&data->canard, cfg->node_id);
+	}
+	memset(data->pub, 0, sizeof(data->pub));
+	data->num_pub = 0;
+	k_mutex_unlock(&data->canard_mtx);
+
+	data->mode = DRONECAN_MODE_OPERATIONAL;
+	atomic_set(&data->started, 1);
+	ret = 0;
+out:
+	k_mutex_unlock(&data->lifecycle_mtx);
+	return ret;
+}
+
+int dronecan_stop(const struct device *dev)
+{
+	const struct dronecan_config *cfg = dev->config;
+	struct dronecan_data *data = dev->data;
+	const struct device *can = cfg->can_bus[0];
+	struct k_work_sync sync;
+	int ret = 0;
+
+	k_mutex_lock(&data->lifecycle_mtx, K_FOREVER);
+
+	if (!atomic_get(&data->started)) {
+		ret = -EALREADY;
+		goto out;
+	}
+
+	atomic_set(&data->started, 0);
+	can_remove_rx_filter(can, data->rx_filter_id);
+	k_msgq_purge(cfg->rx_msgq);
+	k_work_flush(&data->tx_work, &sync); // let queued frames go out first
+
+	if (data->owns_controller) {
+		ret = can_stop(can);
+		if (ret == -EALREADY) {
+			ret = 0;
+		}
+		data->owns_controller = false;
+	}
+	data->mode = DRONECAN_MODE_OFFLINE;
+out:
+	k_mutex_unlock(&data->lifecycle_mtx);
+	return ret;
+}
 
 uint8_t dronecan_get_node_id(const struct device *dev)
 {
-	const struct dronecan_data *data = dev->data;
+	const struct dronecan_config *cfg = dev->config;
+	struct dronecan_data *data = dev->data;
+	uint8_t id = cfg->node_id;
 
-	return data->node_id;
+	if (atomic_get(&data->started)) {
+		k_mutex_lock(&data->canard_mtx, K_FOREVER);
+		id = canardGetLocalNodeID(&data->canard);
+		k_mutex_unlock(&data->canard_mtx);
+	}
+	return id;
 }
+
+// Node status
 
 int dronecan_set_health(const struct device *dev, uint8_t health)
 {
@@ -120,6 +378,67 @@ int dronecan_set_vendor_status(const struct device *dev, uint16_t status)
 	return 0;
 }
 
+// Publish
+
+// Persistent transfer ID for a message type. Call with canard_mtx held.
+static uint8_t *transfer_id_for(struct dronecan_data *data, uint16_t id)
+{
+	for (uint8_t i = 0; i < data->num_pub; i++) {
+		if (data->pub[i].id == id) {
+			return &data->pub[i].transfer_id;
+		}
+	}
+	if (data->num_pub >= ARRAY_SIZE(data->pub)) {
+		return NULL;
+	}
+	data->pub[data->num_pub].id = id;
+	data->pub[data->num_pub].transfer_id = 0;
+	return &data->pub[data->num_pub++].transfer_id;
+}
+
+int dronecan_broadcast(const struct device *dev, const struct dronecan_msg_desc *desc,
+		       enum dronecan_priority p, const void *payload, uint16_t len)
+{
+	struct dronecan_data *data = dev->data;
+	uint8_t *tid;
+	int16_t ret;
+
+	if (desc == NULL || (payload == NULL && len > 0) || len > desc->max_size) {
+		return -EINVAL;
+	}
+	if (!atomic_get(&data->started)) {
+		return -ENETDOWN;
+	}
+
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
+	tid = transfer_id_for(data, desc->id);
+	if (tid == NULL) {
+		ret = -CANARD_ERROR_OUT_OF_MEMORY;
+	} else {
+		ret = canardBroadcast(&data->canard, desc->signature, desc->id, tid, (uint8_t)p,
+				      payload, len);
+	}
+	k_mutex_unlock(&data->canard_mtx);
+
+	if (ret < 0) {
+		switch (-ret) {
+		case CANARD_ERROR_INVALID_ARGUMENT:
+			return -EINVAL;
+		case CANARD_ERROR_OUT_OF_MEMORY:
+			return -ENOMEM;
+		case CANARD_ERROR_NODE_ID_NOT_SET:
+			return -EPERM;
+		default:
+			return -EIO;
+		}
+	}
+
+	k_work_submit_to_queue(&data->tx_workq, &data->tx_work);
+	return 0; // queued: transmission errors show up in the statistics
+}
+
+// Queries
+
 int dronecan_get_node(const struct device *dev, uint8_t id, struct dronecan_node_entry *out)
 {
 #ifdef CONFIG_DRONECAN_NODE_TABLE
@@ -142,32 +461,20 @@ int dronecan_get_node(const struct device *dev, uint8_t id, struct dronecan_node
 
 void dronecan_get_stats(const struct device *dev, struct dronecan_stats *out)
 {
-	const struct dronecan_data *data = dev->data;
+	struct dronecan_data *data = dev->data;
 
-	*out = data->stats; // TODO add libcanard pool stats once initialized
-}
+	*out = data->stats; // counters are not read atomically
 
-int dronecan_start(const struct device *dev)
-{
-	ARG_UNUSED(dev);
-	return -ENOSYS;
-}
+	if (atomic_get(&data->started)) {
+		k_mutex_lock(&data->canard_mtx, K_FOREVER);
+		CanardPoolAllocatorStatistics s = canardGetPoolAllocatorStatistics(&data->canard);
 
-int dronecan_stop(const struct device *dev)
-{
-	ARG_UNUSED(dev);
-	return -ENOSYS;
-}
+		k_mutex_unlock(&data->canard_mtx);
 
-int dronecan_broadcast(const struct device *dev, const struct dronecan_msg_desc *desc,
-		       enum dronecan_priority p, const void *payload, uint16_t len)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(desc);
-	ARG_UNUSED(p);
-	ARG_UNUSED(payload);
-	ARG_UNUSED(len);
-	return -ENOSYS;
+		out->mem_capacity = s.capacity_blocks;
+		out->mem_current = s.current_usage_blocks;
+		out->mem_peak = s.peak_usage_blocks;
+	}
 }
 
 int dronecan_subscribe(const struct device *dev, struct dronecan_subscription *sub,
@@ -188,6 +495,7 @@ int dronecan_unsubscribe(const struct device *dev, struct dronecan_subscription 
 	return -ENOSYS;
 }
 
+// Instances
 
 #define DRONECAN_CAN_BUS(node_id, prop, idx) DEVICE_DT_GET(DT_PHANDLE_BY_IDX(node_id, prop, idx))
 
@@ -202,6 +510,7 @@ int dronecan_unsubscribe(const struct device *dev, struct dronecan_subscription 
 		__aligned(8);                                                                      \
 	CAN_MSGQ_DEFINE(dronecan_rx_msgq_##n, CONFIG_DRONECAN_RX_MSGQ_SIZE);                       \
 	static K_THREAD_STACK_DEFINE(dronecan_rx_stack_##n, CONFIG_DRONECAN_RX_STACK_SIZE);        \
+	static K_THREAD_STACK_DEFINE(dronecan_tx_stack_##n, CONFIG_DRONECAN_TX_STACK_SIZE);        \
 	static K_THREAD_STACK_DEFINE(dronecan_hk_stack_##n,                                        \
 				     CONFIG_DRONECAN_HOUSEKEEPING_STACK_SIZE);                     \
                                                                                                    \
@@ -214,6 +523,9 @@ int dronecan_unsubscribe(const struct device *dev, struct dronecan_subscription 
 		.arena_size = sizeof(dronecan_arena_##n),                                          \
 		.rx_msgq = &dronecan_rx_msgq_##n,                                                  \
 		.rx_stack = dronecan_rx_stack_##n,                                                 \
+		.rx_stack_size = K_THREAD_STACK_SIZEOF(dronecan_rx_stack_##n),                     \
+		.tx_stack = dronecan_tx_stack_##n,                                                 \
+		.tx_stack_size = K_THREAD_STACK_SIZEOF(dronecan_tx_stack_##n),                     \
 		.hk_stack = dronecan_hk_stack_##n,                                                 \
 	};                                                                                         \
                                                                                                    \

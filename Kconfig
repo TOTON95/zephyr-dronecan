@@ -67,6 +67,20 @@ config DRONECAN_HOUSEKEEPING_STACK_SIZE
 	int "NodeStatus / housekeeping thread stack size"
 	default 2048
 
+config DRONECAN_TX_STACK_SIZE
+	int "TX work queue stack size"
+	default 1536
+	help
+	  Stack of the thread that sends queued frames. It also holds one batch of
+	  DRONECAN_TX_DRAIN_MAX frames.
+
+config DRONECAN_MAX_PUBLISHED_TYPES
+	int "Max distinct message types published"
+	default 8
+	help
+	  Number of message types the node can broadcast. Each needs a persistent
+	  transfer ID.
+
 config DRONECAN_THREAD_PRIORITY
 	int "Thread priority"
 	default 10 #TBD
@@ -85,6 +99,12 @@ config DRONECAN_RX_MSGQ_SIZE
 config DRONECAN_TX_TIMEOUT_MS
 	int "CAN send timeout (ms)"
 	default 10
+
+config DRONECAN_LOOPBACK_MODE
+	bool "Start the CAN controller in loopback mode"
+	help
+	  For tests and self-test: the node receives its own frames. On a real
+	  controller the frames do not reach the bus. Leave disabled in products.
 
 config DRONECAN_NODE_TIMEOUT_MS
 	int "Node considered stale after (ms)"
