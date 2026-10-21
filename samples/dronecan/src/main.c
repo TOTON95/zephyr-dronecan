@@ -5,6 +5,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/logging/log.h>
 
 #include <dronecan.h>
@@ -13,6 +14,25 @@
 LOG_MODULE_REGISTER(dronecan_sample, LOG_LEVEL_INF);
 
 static const struct device *const dc = DEVICE_DT_GET(DT_NODELABEL(dronecan0));
+
+#if DT_HAS_CHOSEN(zephyr_console) && DT_NODE_HAS_COMPAT(DT_CHOSEN(zephyr_console), zephyr_cdc_acm_uart)
+#define CONSOLE_IS_CDC_ACM 1
+#endif
+
+// A USB console shows nothing until the host opens the port: wait for it (at most 15 s).
+static void wait_for_console(void)
+{
+#ifdef CONSOLE_IS_CDC_ACM
+	const struct device *console = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+	uint32_t dtr = 0;
+
+	for (int i = 0; i < 150 && dtr == 0; i++) {
+		uart_line_ctrl_get(console, UART_LINE_CTRL_DTR, &dtr);
+		k_sleep(K_MSEC(100));
+	}
+	k_sleep(K_MSEC(200)); // let the terminal settle
+#endif
+}
 
 static void show_stats(const char *when)
 {
@@ -34,6 +54,7 @@ int main(void)
 	static const struct dronecan_msg_desc big = {.id = 1000, .signature = 0x1234, .max_size = 64};
 	uint8_t payload[20] = {0};
 
+	wait_for_console();
 	LOG_INF("dronecan sample");
 
 	if (!device_is_ready(dc)) {
@@ -68,8 +89,10 @@ int main(void)
 	k_sleep(K_MSEC(300));
 	show_stats("after restart");
 
+	// NodeStatus keeps going out once a second: tx should grow by one each time.
 	while (1) {
-		k_sleep(K_SECONDS(1));
+		show_stats("running");
+		k_sleep(K_SECONDS(2));
 	}
 
 	return 0;
