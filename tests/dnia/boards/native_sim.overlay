@@ -1,0 +1,24 @@
+// Node 10 is the allocator (the first ID it could hand out), the two 0 nodes are anonymous clients:
+// one uses the library, the other is driven by the test
+/ {
+	dronecan0: dronecan0 {
+		compatible = "zephyr,dronecan";
+		can-buses = <&can_loopback0>;
+		node-id = <10>;
+		status = "okay";
+	};
+
+	dronecan1: dronecan1 {
+		compatible = "zephyr,dronecan";
+		can-buses = <&can_loopback0>;
+		node-id = <0>;
+		status = "okay";
+	};
+
+	dronecan2: dronecan2 {
+		compatible = "zephyr,dronecan";
+		can-buses = <&can_loopback0>;
+		node-id = <0>;
+		status = "okay";
+	};
+};
