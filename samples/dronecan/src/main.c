@@ -14,15 +14,13 @@ LOG_MODULE_REGISTER(dronecan_sample, LOG_LEVEL_INF);
 
 static const struct device *const dc = DEVICE_DT_GET(DT_NODELABEL(dronecan0));
 
-static struct dronecan_subscription node_status_sub;
-
-static void on_node_status(const struct device *dev, const struct dronecan_transfer *t,
-			   void *user_data)
+static void show_stats(const char *when)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(user_data);
+	struct dronecan_stats s;
 
-	LOG_INF("NodeStatus from node %u (%u bytes)", t->source_node_id, t->payload_len);
+	dronecan_get_stats(dc, &s);
+	LOG_INF("%s: tx=%u tx_err=%u pool %u/%u (peak %u)", when, s.tx, s.tx_err, s.mem_current,
+		s.mem_capacity, s.mem_peak);
 }
 
 int main(void)
@@ -32,7 +30,9 @@ int main(void)
 		.signature = UAVCAN_PROTOCOL_NODESTATUS_SIGNATURE,
 		.max_size = UAVCAN_PROTOCOL_NODESTATUS_MAX_SIZE,
 	};
-	int ret;
+
+	static const struct dronecan_msg_desc big = {.id = 1000, .signature = 0x1234, .max_size = 64};
+	uint8_t payload[20] = {0};
 
 	LOG_INF("dronecan sample");
 
@@ -41,17 +41,34 @@ int main(void)
 		return -ENODEV;
 	}
 
-	ret = dronecan_start(dc);
-	LOG_INF("dronecan_start: %d", ret);
+	LOG_INF("broadcast before start: %d", dronecan_broadcast(dc, &node_status,
+		DRONECAN_PRIORITY_LOW, payload, 7));
+	LOG_INF("stop before start: %d", dronecan_stop(dc));
 
-	ret = dronecan_subscribe(dc, &node_status_sub, &node_status, on_node_status, NULL);
-	LOG_INF("dronecan_subscribe: %d", ret);
+	LOG_INF("start: %d", dronecan_start(dc));
+	LOG_INF("second start: %d", dronecan_start(dc));
+	LOG_INF("node id: %u", dronecan_get_node_id(dc));
 
-	LOG_INF("set_health(OK): %d, set_mode(99): %d", dronecan_set_health(dc, DRONECAN_HEALTH_OK),
-		dronecan_set_mode(dc, 99));
+	LOG_INF("broadcast NodeStatus-sized: %d",
+		dronecan_broadcast(dc, &node_status, DRONECAN_PRIORITY_LOW, payload, 7));
+	LOG_INF("broadcast 20 bytes: %d",
+		dronecan_broadcast(dc, &big, DRONECAN_PRIORITY_LOW, payload, sizeof(payload)));
+	LOG_INF("broadcast too long: %d",
+		dronecan_broadcast(dc, &big, DRONECAN_PRIORITY_LOW, payload, 65));
+
+	k_sleep(K_MSEC(300));
+	show_stats("after traffic");
+
+	LOG_INF("stop: %d", dronecan_stop(dc));
+	LOG_INF("broadcast after stop: %d",
+		dronecan_broadcast(dc, &node_status, DRONECAN_PRIORITY_LOW, payload, 7));
+	LOG_INF("restart: %d", dronecan_start(dc));
+	LOG_INF("broadcast after restart: %d",
+		dronecan_broadcast(dc, &node_status, DRONECAN_PRIORITY_LOW, payload, 7));
+	k_sleep(K_MSEC(300));
+	show_stats("after restart");
 
 	while (1) {
-		LOG_INF("node id: %u", dronecan_get_node_id(dc));
 		k_sleep(K_SECONDS(1));
 	}
 
