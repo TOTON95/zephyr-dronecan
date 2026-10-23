@@ -1,0 +1,16 @@
+// Both nodes sit on the loopback controller: the peripheral asks the flight controller for an ID
+/ {
+	dronecan0: dronecan {
+		compatible = "zephyr,dronecan";
+		can-buses = <&can_loopback0>;
+		node-id = <0>;
+		status = "okay";
+	};
+
+	dronecan_fc: dronecan_fc {
+		compatible = "zephyr,dronecan";
+		can-buses = <&can_loopback0>;
+		node-id = <42>;
+		status = "okay";
+	};
+};
