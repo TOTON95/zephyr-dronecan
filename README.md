@@ -182,6 +182,19 @@ west build -b native_sim samples/dronecan_peripheral
 west build -b control_n1 samples/dronecan_peripheral
 ```
 
+### `samples/dronecan_sensor`
+
+A peripheral without sensors: it gets its node ID from an allocator like `samples/dronecan_peripheral`
+and then sends made-up readings. `BatteryInfo` (a discharging 4S battery, 10 Hz),
+`RawAirData` (sea level with a varying dynamic pressure, 20 Hz) and a lidar `Measurement` (0.5 to 3.5 m,
+10 Hz). A flight controller or the DroneCAN GUI Tool should show them as live data. On `native_sim` a second
+node plays the flight controller and counts what arrives.
+
+```sh
+west build -b native_sim samples/dronecan_sensor
+west build -b control_n1 samples/dronecan_sensor
+```
+
 If the DSDL projects are not in the default location, point CMake at them with
 `-DDRONECAN_DSDL_DIR=<path>` and `-DDRONECAN_DSDLC_DIR=<path>`.
 
