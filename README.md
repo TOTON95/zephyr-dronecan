@@ -223,3 +223,6 @@ Third-party components keep their own licenses:
 - libcanard: MIT
 - DroneCAN DSDL definitions: MIT
 - dronecan_dsdlc (build-time generator, not distributed): (L)GPL v3; generated code is MIT
+
+A firmware that includes these components must keep their copyright and permission notices: see
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
