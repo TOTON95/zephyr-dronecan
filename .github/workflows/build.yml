@@ -1,0 +1,40 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test zephyr-dronecan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          path: zephyr-dronecan
+          submodules: true
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Setup Zephyr RTOS
+        uses: zephyrproject-rtos/action-zephyr-setup@be8136a8bba01580485d98b7ad2d32477c36a49a # v1.0.15
+        with:
+          app-path: zephyr-dronecan
+          toolchains: arm-zephyr-eabi
+
+      - name: Build the samples
+        run: |
+          for sample in dronecan dronecan_shell dronecan_peripheral; do
+            west build -p always -b native_sim -d build/$sample zephyr-dronecan/samples/$sample
+          done
+
+      - name: Run the tests
+        run: west twister -T zephyr-dronecan/tests -p native_sim --inline-logs -v
