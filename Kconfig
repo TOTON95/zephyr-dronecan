@@ -134,6 +134,13 @@ config DRONECAN_MAX_RX_PAYLOAD
 	help
 	  Larger transfers are not delivered. One buffer is kept per node.
 
+config DRONECAN_MAX_SERVICE_RESPONSE
+	int "Largest service response (bytes)"
+	range 1 65535
+	default 256
+	help
+	  Size of the buffer a service handler fills. One buffer is kept per node.
+
 config DRONECAN_DNIA_TIMEOUT_MS
 	int "Allocation follow-up timeout (ms)"
 	default 500

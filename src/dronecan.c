@@ -83,11 +83,7 @@ struct dnia_client {
 };
 #endif
 
-/*
- * Lock order: lifecycle_mtx -> canard_mtx -> table_mtx, canard_mtx -> sub_mtx.
- * Never call a subscription callback or take canard_mtx while holding sub_mtx.
- * Never log or call can_send() with canard_mtx held.
- */
+// Lock order: lifecycle_mtx -> canard_mtx -> table_mtx, canard_mtx -> sub_mtx.
 struct dronecan_data {
 	const struct device *dev;
 	CanardInstance canard;
@@ -97,7 +93,8 @@ struct dronecan_data {
 	struct k_mutex sub_mtx;
 	struct k_condvar sub_cv;
 	sys_slist_t subs;
-	struct dronecan_subscription *in_flight; // callback running, guarded by sub_mtx
+	sys_slist_t services; // guarded by sub_mtx
+	const void *in_flight; // subscription or service running, guarded by sub_mtx
 
 	struct k_thread rx_thread;
 	struct k_work_q tx_workq; // one sender, so frames leave in queue order
@@ -121,7 +118,9 @@ struct dronecan_data {
 	// Written and read by the RX thread only
 	struct dronecan_transfer rx_info;
 	uint8_t rx_payload[CONFIG_DRONECAN_MAX_RX_PAYLOAD];
+	bool rx_request; // the queued transfer is a service request
 	bool rx_ready;
+	uint8_t svc_response[CONFIG_DRONECAN_MAX_SERVICE_RESPONSE];
 #ifdef CONFIG_DRONECAN_DNIA_SERVER
 	struct dnia dnia; // canard_mtx
 #endif
@@ -143,18 +142,32 @@ static uint64_t canard_time_usec(void)
 	return k_ticks_to_us_floor64(k_uptime_ticks()) + 1U;
 }
 
-// Signature of a message somebody subscribed to. Call with canard_mtx held.
-static bool find_signature(struct dronecan_data *data, uint16_t id, uint64_t *signature)
+// Signature of a message somebody subscribed to, or of a service that has a handler.
+static bool find_signature(struct dronecan_data *data, uint16_t id, bool request,
+			   uint64_t *signature)
 {
-	struct dronecan_subscription *sub;
 	bool found = false;
 
 	k_mutex_lock(&data->sub_mtx, K_FOREVER);
-	SYS_SLIST_FOR_EACH_CONTAINER(&data->subs, sub, node) {
-		if (sub->data_type_id == id) {
-			*signature = sub->signature;
-			found = true;
-			break;
+	if (request) {
+		struct dronecan_service *svc;
+
+		SYS_SLIST_FOR_EACH_CONTAINER(&data->services, svc, node) {
+			if (svc->data_type_id == id) {
+				*signature = svc->signature;
+				found = true;
+				break;
+			}
+		}
+	} else {
+		struct dronecan_subscription *sub;
+
+		SYS_SLIST_FOR_EACH_CONTAINER(&data->subs, sub, node) {
+			if (sub->data_type_id == id) {
+				*signature = sub->signature;
+				found = true;
+				break;
+			}
 		}
 	}
 	k_mutex_unlock(&data->sub_mtx);
@@ -202,7 +215,6 @@ static void expire_nodes(struct dronecan_data *data)
 
 #ifdef CONFIG_DRONECAN_DNIA_SERVER
 // Returns the node ID granted to this unique ID, or grants a new one if it has none.
-// Returns 0 when no ID is free. Call with canard_mtx held.
 static uint8_t dnia_grant_id(struct dronecan_data *data, const uint8_t *uid)
 {
 	struct dnia *d = &data->dnia;
@@ -339,6 +351,10 @@ static bool dronecan_should_accept(const CanardInstance *ins, uint64_t *out_sign
 {
 	struct dronecan_data *data = ins->user_reference;
 
+	if (transfer_type == CanardTransferTypeRequest) {
+		return source_node_id != DRONECAN_NODE_ID_ANON &&
+		       find_signature(data, data_type_id, true, out_signature);
+	}
 	if (transfer_type != CanardTransferTypeBroadcast) {
 		return false;
 	}
@@ -358,7 +374,7 @@ static bool dronecan_should_accept(const CanardInstance *ins, uint64_t *out_sign
 		return true;
 	}
 #endif
-	return find_signature(data, data_type_id, out_signature);
+	return find_signature(data, data_type_id, false, out_signature);
 }
 
 // Copy the transfer for the subscribers, which run after canard_mtx is released.
@@ -367,7 +383,10 @@ static void queue_rx(struct dronecan_data *data, const CanardRxTransfer *t)
 	uint64_t signature;
 	uint16_t len = t->payload_len;
 
-	if (len > sizeof(data->rx_payload) || !find_signature(data, t->data_type_id, &signature)) {
+	bool request = t->transfer_type == CanardTransferTypeRequest;
+
+	if (len > sizeof(data->rx_payload) ||
+	    !find_signature(data, t->data_type_id, request, &signature)) {
 		return;
 	}
 	for (uint16_t i = 0; i < len; i++) {
@@ -382,6 +401,7 @@ static void queue_rx(struct dronecan_data *data, const CanardRxTransfer *t)
 		.payload_len = len,
 		.timestamp_ms = t->timestamp_usec / 1000U,
 	};
+	data->rx_request = request;
 	data->rx_ready = true;
 }
 
@@ -390,6 +410,11 @@ static void dronecan_on_reception(CanardInstance *ins, CanardRxTransfer *transfe
 	struct dronecan_data *data = ins->user_reference;
 
 	queue_rx(data, transfer); // first: the handlers below may release the payload
+
+	// Message and service IDs are separate numbers: the handlers below are for messages
+	if (transfer->transfer_type != CanardTransferTypeBroadcast) {
+		return;
+	}
 
 	switch (transfer->data_type_id) {
 #ifdef CONFIG_DRONECAN_NODE_TABLE
@@ -439,6 +464,65 @@ static void dispatch_rx(const struct device *dev)
 		k_condvar_broadcast(&data->sub_cv);
 	}
 	k_mutex_unlock(&data->sub_mtx);
+}
+
+BUILD_ASSERT(CONFIG_DRONECAN_MAX_SERVICE_RESPONSE <= UINT16_MAX,
+	     "the handler gets the response size as 16 bits");
+
+// Call the handler of the queued request and send its response. No lock is held while it runs.
+static void dispatch_service(const struct device *dev)
+{
+	struct dronecan_data *data = dev->data;
+	const struct dronecan_transfer *req = &data->rx_info;
+	struct dronecan_service *svc;
+	dronecan_service_cb_t cb = NULL;
+	void *user_data = NULL;
+	uint64_t signature = 0;
+	uint8_t transfer_id = req->transfer_id; // the response carries the request's ID
+	int len;
+	int16_t ret;
+
+	k_mutex_lock(&data->sub_mtx, K_FOREVER);
+	SYS_SLIST_FOR_EACH_CONTAINER(&data->services, svc, node) {
+		if (svc->data_type_id == req->data_type_id) {
+			cb = svc->cb;
+			user_data = svc->user_data;
+			signature = svc->signature;
+			data->in_flight = svc;
+			break;
+		}
+	}
+	k_mutex_unlock(&data->sub_mtx);
+	if (cb == NULL) {
+		return; // unregistered since it was accepted
+	}
+
+	data->stats.svc_requests++;
+	len = cb(dev, req, data->svc_response, sizeof(data->svc_response), user_data);
+
+	k_mutex_lock(&data->sub_mtx, K_FOREVER);
+	data->in_flight = NULL;
+	k_condvar_broadcast(&data->sub_cv);
+	k_mutex_unlock(&data->sub_mtx);
+
+	if (len < 0 || len > sizeof(data->svc_response)) {
+		data->stats.svc_errors++;
+		return;
+	}
+
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
+	ret = canardRequestOrRespond(&data->canard, req->source_node_id, signature,
+				     req->data_type_id, &transfer_id, req->priority, CanardResponse,
+				     data->svc_response, len);
+	k_mutex_unlock(&data->canard_mtx);
+
+	if (ret < 0) {
+		data->stats.svc_errors++;
+		LOG_DBG("response failed: %d", ret);
+		return;
+	}
+	data->stats.svc_responses++;
+	k_work_submit_to_queue(&data->tx_workq, &data->tx_work);
 }
 
 // TX path
@@ -590,7 +674,11 @@ static void rx_thread_fn(void *p1, void *p2, void *p3)
 
 		if (data->rx_ready) {
 			data->rx_ready = false;
-			dispatch_rx(dev);
+			if (data->rx_request) {
+				dispatch_service(dev);
+			} else {
+				dispatch_rx(dev);
+			}
 		}
 	}
 }
@@ -669,6 +757,7 @@ static int dronecan_init(const struct device *dev)
 	k_mutex_init(&data->sub_mtx);
 	k_condvar_init(&data->sub_cv);
 	sys_slist_init(&data->subs);
+	sys_slist_init(&data->services);
 	k_sem_init(&data->tx_done, 0, 1);
 #ifdef CONFIG_DRONECAN_DNIA_CLIENT
 	k_sem_init(&data->dnia_cl.answer, 0, 1);
@@ -1157,6 +1246,57 @@ int dronecan_unsubscribe(const struct device *dev, struct dronecan_subscription 
 		return -ENOENT;
 	}
 	while (data->in_flight == sub) {
+		k_condvar_wait(&data->sub_cv, &data->sub_mtx, K_FOREVER);
+	}
+	k_mutex_unlock(&data->sub_mtx);
+	return 0;
+}
+
+int dronecan_register_service(const struct device *dev, struct dronecan_service *svc,
+			      const struct dronecan_msg_desc *desc, dronecan_service_cb_t cb,
+			      void *user_data)
+{
+	struct dronecan_data *data = dev->data;
+	struct dronecan_service *other;
+
+	if (svc == NULL || desc == NULL || cb == NULL || desc->id > 255) { // service IDs are 8 bit
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&data->sub_mtx, K_FOREVER);
+	SYS_SLIST_FOR_EACH_CONTAINER(&data->services, other, node) {
+		if (other == svc) {
+			k_mutex_unlock(&data->sub_mtx);
+			return -EALREADY;
+		}
+		if (other->data_type_id == desc->id) {
+			k_mutex_unlock(&data->sub_mtx);
+			return -EEXIST;
+		}
+	}
+	svc->data_type_id = desc->id;
+	svc->signature = desc->signature;
+	svc->cb = cb;
+	svc->user_data = user_data;
+	sys_slist_append(&data->services, &svc->node);
+	k_mutex_unlock(&data->sub_mtx);
+	return 0;
+}
+
+int dronecan_unregister_service(const struct device *dev, struct dronecan_service *svc)
+{
+	struct dronecan_data *data = dev->data;
+
+	if (svc == NULL) {
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&data->sub_mtx, K_FOREVER);
+	if (!sys_slist_find_and_remove(&data->services, &svc->node)) {
+		k_mutex_unlock(&data->sub_mtx);
+		return -ENOENT;
+	}
+	while (data->in_flight == svc) {
 		k_condvar_wait(&data->sub_cv, &data->sub_mtx, K_FOREVER);
 	}
 	k_mutex_unlock(&data->sub_mtx);

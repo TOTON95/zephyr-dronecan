@@ -57,9 +57,6 @@ struct dronecan_transfer {
 };
 
 // Callback to receive packages.
-// Runs in the RX thread (not an ISR) with no canard lock held: keep it short,
-// it may call dronecan_broadcast() but not dronecan_stop()/(un)subscribe().
-// t->payload is read-only and valid only during the callback: copy to keep it.
 typedef void (*dronecan_rx_cb_t)(const struct device *dev,
 				 const struct dronecan_transfer *t,
 				 void *user_data);
@@ -70,6 +67,21 @@ struct dronecan_subscription {
 	uint16_t data_type_id;
 	uint64_t signature;
 	dronecan_rx_cb_t cb;
+	void *user_data;
+};
+
+// Handler of a service. Fills the response (at most response_size bytes) and returns its
+// length, or a negative errno to send no response.
+typedef int (*dronecan_service_cb_t)(const struct device *dev,
+				     const struct dronecan_transfer *request, void *response,
+				     uint16_t response_size, void *user_data);
+
+// DroneCAN service
+struct dronecan_service {
+	sys_snode_t node;
+	uint16_t data_type_id;
+	uint64_t signature;
+	dronecan_service_cb_t cb;
 	void *user_data;
 };
 
@@ -88,6 +100,10 @@ struct dronecan_stats {
 	uint32_t mem_capacity;	// total blocks in arena
 	uint32_t mem_current;	// blocks in use right now
 	uint32_t mem_peak;	// peak blocks ever used
+
+	uint32_t svc_requests;	// service requests handed to a handler
+	uint32_t svc_responses;	// responses queued
+	uint32_t svc_errors;	// requests without a response (handler error, no memory)
 
 	// CAN controller, read when asked
 	enum can_state can_state;
@@ -119,19 +135,21 @@ int dronecan_broadcast(const struct device *dev, const struct dronecan_msg_desc 
 		       enum dronecan_priority p, const void *payload, uint16_t len);
 
 // Un/Subscribe for a topic from DroneCAN node.
-// The caller owns *sub: keep it valid until dronecan_unsubscribe() returns,
-// after which the callback is no longer running. Several subscriptions per
-// message are allowed. Calls are thread-safe, not ISR-safe; return -errno.
 int dronecan_subscribe(const struct device *dev, struct dronecan_subscription *sub,
 		       const struct dronecan_msg_desc *desc, dronecan_rx_cb_t cb, void *user_data);
 int dronecan_unsubscribe(const struct device *dev, struct dronecan_subscription *sub);
+
+// Un/Register the handler of a service. One handler per service ID.
+int dronecan_register_service(const struct device *dev, struct dronecan_service *svc,
+			      const struct dronecan_msg_desc *desc, dronecan_service_cb_t cb,
+			      void *user_data);
+int dronecan_unregister_service(const struct device *dev, struct dronecan_service *svc);
 
 // Node table and statistics
 int dronecan_get_node(const struct device *dev, uint8_t id, struct dronecan_node_entry *out);
 void dronecan_get_stats(const struct device *dev, struct dronecan_stats *out);
 
 // Blocks until an allocator grants this anonymous node an ID, and uses it.
-// Returns 0, -EALREADY (has an ID), -ETIMEDOUT or another -errno. Not for ISRs.
 int dronecan_dnia_request(const struct device *dev, k_timeout_t timeout);
 
 #ifdef __cplusplus
