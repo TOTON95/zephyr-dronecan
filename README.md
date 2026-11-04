@@ -128,6 +128,9 @@ table, then commit the result:
 python3 scripts/gen_kconfig_messages.py <DSDL directory>
 ```
 
+With `--check` nothing is written, and the script fails if the committed files differ from what the
+DSDL gives. CI runs it on the DSDL revision pinned in `west.yml`.
+
 ### Shell
 
 With `CONFIG_SHELL=y` and `CONFIG_DRONECAN_SHELL=y` the `dc` command is available. `<dev>` is the
