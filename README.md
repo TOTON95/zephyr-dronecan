@@ -128,6 +128,9 @@ table, then commit the result:
 python3 scripts/gen_kconfig_messages.py <DSDL directory>
 ```
 
+With `--check` nothing is written, and the script fails if the committed files differ from what the
+DSDL gives. CI runs it on the DSDL revision pinned in `west.yml`.
+
 ### Shell
 
 With `CONFIG_SHELL=y` and `CONFIG_DRONECAN_SHELL=y` the `dc` command is available. `<dev>` is the
@@ -198,6 +201,7 @@ west twister -T tests -p native_sim
 | --- | --- |
 | `tests/core` | Start and stop, publishing, subscriptions, multi-frame delivery, NodeStatus and the node table, statistics |
 | `tests/dnia` | The allocation server and the allocation client |
+| `tests/messages` | The message table and `Kconfig.messages` against the headers dronecan_dsdlc generates, for all messages |
 
 Only one node on a bus should be an allocator. The allocation server option applies to the whole
 image, so every node with an ID in the `tests/dnia` image answers requests: the suite keeps a single

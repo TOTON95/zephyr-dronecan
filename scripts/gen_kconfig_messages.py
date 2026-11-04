@@ -3,13 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Generate Kconfig.messages and src/dronecan_msg_table.c from the DSDL definitions.
 
-Usage: scripts/gen_kconfig_messages.py <DSDL dir>
+Usage: scripts/gen_kconfig_messages.py [--check] <DSDL dir>
 
-Run it after the DSDL revision changes and commit the result. Needs the
-'dronecan' Python package (requirements.txt).
+Run it after the DSDL revision changes and commit the result. With --check nothing is written: it
+fails when the committed files differ from what the DSDL gives. Needs the 'dronecan' Python package
+(requirements.txt).
 """
 
 import argparse
+import difflib
 import os
 import sys
 
@@ -38,7 +40,7 @@ def load(dsdl_dir):
     return sorted(msgs, key=lambda t: t.full_name)
 
 
-def write_kconfig(msgs, path):
+def render_kconfig(msgs):
     out = [
         "# " + HEADER,
         "",
@@ -61,11 +63,10 @@ def write_kconfig(msgs, path):
         out.append(f"\t  Data type ID {t.default_dtid}.")
         out.append("")
     out.append("endmenu # Messages")
-    with open(path, "w") as f:
-        f.write("\n".join(out) + "\n")
+    return "\n".join(out) + "\n"
 
 
-def write_table(msgs, path):
+def render_table(msgs):
     # Same values as in the dronecan_dsdlc headers
     out = [
         "/* " + HEADER + " */",
@@ -88,13 +89,32 @@ def write_table(msgs, path):
         "",
         "const size_t dronecan_msg_table_len = ARRAY_SIZE(dronecan_msg_table);",
     ]
-    with open(path, "w") as f:
-        f.write("\n".join(out) + "\n")
+    return "\n".join(out) + "\n"
+
+
+def check(files, root, dsdl_dir):
+    stale = []
+    for rel, text in files.items():
+        path = os.path.join(root, rel)
+        current = open(path).read() if os.path.exists(path) else ""
+        if current == text:
+            continue
+        stale.append(rel)
+        diff = list(difflib.unified_diff(current.splitlines(True), text.splitlines(True),
+                                         f"{rel} (committed)", f"{rel} (from the DSDL)", n=0))
+        sys.stdout.writelines(diff[:40])
+        if len(diff) > 40:
+            print(f"... {len(diff) - 40} more lines")
+    if stale:
+        sys.exit(f"{', '.join(stale)} out of date: run scripts/gen_kconfig_messages.py {dsdl_dir} "
+                 "and commit the result")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("dsdl_dir", help="DSDL repository (contains uavcan/, dronecan/, ardupilot/)")
+    ap.add_argument("--check", action="store_true",
+                    help="write nothing, fail if the committed files are out of date")
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -102,8 +122,17 @@ def main():
     missing = REQUIRED - {t.full_name for t in msgs}
     if missing:
         sys.exit(f"required messages not found in {args.dsdl_dir}: {sorted(missing)}")
-    write_kconfig(msgs, os.path.join(root, "Kconfig.messages"))
-    write_table(msgs, os.path.join(root, "src", "dronecan_msg_table.c"))
+    files = {
+        "Kconfig.messages": render_kconfig(msgs),
+        os.path.join("src", "dronecan_msg_table.c"): render_table(msgs),
+    }
+    if args.check:
+        check(files, root, args.dsdl_dir)
+        print(f"{len(msgs)} messages, the committed files are up to date")
+        return
+    for rel, text in files.items():
+        with open(os.path.join(root, rel), "w") as f:
+            f.write(text)
     print(f"{len(msgs)} messages")
 
 
