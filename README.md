@@ -131,6 +131,49 @@ python3 scripts/gen_kconfig_messages.py <DSDL directory>
 With `--check` nothing is written, and the script fails if the committed files differ from what the
 DSDL gives. CI runs it on the DSDL revision pinned in `west.yml`.
 
+### Services
+
+A node answers a DroneCAN service request with a handler you register. The handler fills the
+response and returns its length, and the module sends it to the requester with the request's
+transfer ID and priority. There is one handler per service ID (0 to 255).
+
+```c
+static int echo(const struct device *dev, const struct dronecan_transfer *req,
+		void *response, uint16_t response_size, void *user_data)
+{
+	if (req->payload_len > response_size) {
+		return -ENOSPC;	// a negative errno sends no response
+	}
+	memcpy(response, req->payload, req->payload_len);
+	return req->payload_len;
+}
+
+static struct dronecan_service svc;
+static const struct dronecan_msg_desc desc = {
+	.id = MY_SERVICE_ID,
+	.signature = MY_SERVICE_SIGNATURE,
+};
+
+dronecan_register_service(dev, &svc, &desc, echo, NULL);
+```
+
+For a service from the DSDL, use its generated `*_ID` and `*_SIGNATURE` macros. The generated
+encoders write up to the type's `MAX_SIZE` bytes, so encode into a buffer of that size and copy the
+result into `response`. The response buffer holds `CONFIG_DRONECAN_MAX_SERVICE_RESPONSE` bytes (256
+by default). `dronecan_get_stats()` counts requests, responses and failures.
+
+Handlers and subscription callbacks run in the receive thread with no lock held:
+
+- Keep them short. They delay all reception of the node, and the receive queue
+  (`DRONECAN_RX_MSGQ_SIZE` frames) can overflow. Hand slow work, such as a flash write, to another
+  threadd.
+
+- They may call `dronecan_broadcast()`, but not `dronecan_stop()` or the unsubscribe and
+  unregister calls: those wait for a running callback, so they would wait for themselves.
+
+- The request or message payload is valid only during the call. Keep `*sub` or `*svc` valid until
+  the unsubscribe or unregister call returns.
+
 ### Shell
 
 With `CONFIG_SHELL=y` and `CONFIG_DRONECAN_SHELL=y` the `dc` command is available. `<dev>` is the
@@ -206,6 +249,35 @@ west twister -T tests -p native_sim
 Only one node on a bus should be an allocator. The allocation server option applies to the whole
 image, so every node with an ID in the `tests/dnia` image answers requests: the suite keeps a single
 node with an ID.
+
+## How it works
+
+Each node has its own libcanard instance, memory pool, queues and three threads: receive
+(`dronecan_rx`), transmit (`dronecan_tx`, a work queue) and housekeeping (`dronecan_hk`, NodeStatus
+and expiry). Several nodes can share a CAN controller: the first one started owns it.
+
+- **Locks:** `lifecycle_mtx` → `canard_mtx` → `table_mtx`, and `canard_mtx` → `sub_mtx`. Never call
+  a callback while holding `canard_mtx` or `sub_mtx`, and never log or call `can_send()` while
+  holding `canard_mtx`. libcanard runs its accept and reception callbacks with `canard_mtx` held.
+
+- **Receiving:** the receive thread feeds frames to libcanard and copies each wanted transfer
+  (up to `DRONECAN_MAX_RX_PAYLOAD` bytes) while still under the lock. It calls subscribers and
+  service handlers only after releasing it. Only broadcasts reach the module's own handlers,
+  because a service can have the same number as a message.
+
+- **Sending:** frames go out one at a time with a completion callback, so frames with the same ID
+  keep their order. A frame nobody acknowledges within `DRONECAN_TX_ACK_TIMEOUT_MS` makes the node
+  drop its queued frames, counted in `tx_err`, until the bus answers again.
+
+- **Memory:** the pool is `mem-blocks` blocks, aligned to 8. libcanard keeps one block per
+  accepted (message type, source node) pair until it goes stale, so a dense bus can need more than
+  the default 64. `dronecan_get_stats()` reports the peak.
+
+- **Time:** libcanard treats a timestamp of 0 as unset, so the module passes uptime in
+  microseconds plus one.
+
+- **Allocation:** only one node on a bus should be an allocator: the option applies to the whole
+  image, so every node with an ID answers requests.
 
 ## Repository layout
 
