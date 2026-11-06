@@ -47,8 +47,9 @@ struct dronecan_pub {
 	uint8_t transfer_id;
 };
 
+#define NODE_UID_LEN 16
 #if defined(CONFIG_DRONECAN_DNIA_SERVER) || defined(CONFIG_DRONECAN_DNIA_CLIENT)
-#define DNIA_UID_LEN 16
+#define DNIA_UID_LEN NODE_UID_LEN
 #endif
 
 #ifdef CONFIG_DRONECAN_DNIA_SERVER
@@ -141,6 +142,20 @@ static uint64_t canard_time_usec(void)
 {
 	return k_ticks_to_us_floor64(k_uptime_ticks()) + 1U;
 }
+
+#ifdef CONFIG_DRONECAN_DNIA_CLIENT
+// Unique ID for a node, the MCU serial number is padded with zeros.
+static int node_unique_id(uint8_t uid[NODE_UID_LEN])
+{
+	ssize_t n;
+	memset(uid, 0, NODE_UID_LEN);
+	n = hwinfo_get_device_id(uid, NODE_UID_LEN);
+	if (n <= 0) {
+		return n < 0 ? (int)n : -ENOTSUP;
+	}
+	return 0;
+}
+#endif //CONFIG_DRONECAN_DNIA_CLIENT
 
 // Signature of a message somebody subscribed to, or of a service that has a handler.
 static bool find_signature(struct dronecan_data *data, uint16_t id, bool request,
@@ -691,6 +706,15 @@ static const struct dronecan_msg_desc node_status_desc = {
 	.max_size = UAVCAN_PROTOCOL_NODESTATUS_MAX_SIZE,
 };
 
+// Call with canard_mtx, keeps health, mode and vendor status consistent.
+static void node_status_fill(struct dronecan_data *data, struct uavcan_protocol_NodeStatus *ns)
+{
+	ns->health = data->health;
+	ns->mode = data->mode;
+	ns->vendor_specific_status_code = data->vendor_status;
+	ns->uptime_sec = k_uptime_get_32() / 1000U;
+}
+
 // Broadcasts NodeStatus and drops stale partial transfers.
 static void hk_thread_fn(void *p1, void *p2, void *p3)
 {
@@ -713,12 +737,9 @@ static void hk_thread_fn(void *p1, void *p2, void *p3)
 		uint8_t buf[UAVCAN_PROTOCOL_NODESTATUS_MAX_SIZE];
 		uint8_t node_id;
 
-		// One critical section, so health, mode and vendor status are consistent.
 		k_mutex_lock(&data->canard_mtx, K_FOREVER);
 		node_id = canardGetLocalNodeID(&data->canard);
-		ns.health = data->health;
-		ns.mode = data->mode;
-		ns.vendor_specific_status_code = data->vendor_status;
+		node_status_fill(data, &ns);
 		canardCleanupStaleTransfers(&data->canard, canard_time_usec());
 		k_mutex_unlock(&data->canard_mtx);
 
@@ -730,7 +751,6 @@ static void hk_thread_fn(void *p1, void *p2, void *p3)
 			continue; // anonymous nodes must not broadcast NodeStatus
 		}
 
-		ns.uptime_sec = k_uptime_get_32() / 1000U;
 		uint32_t len = uavcan_protocol_NodeStatus_encode(&ns, buf);
 		int ret = dronecan_broadcast(dev, &node_status_desc, DRONECAN_PRIORITY_LOW, buf,
 					     len);
@@ -1099,7 +1119,6 @@ int dronecan_dnia_request(const struct device *dev, k_timeout_t timeout)
 	struct dnia_client *c = &data->dnia_cl;
 	uint8_t uid[DNIA_UID_LEN] = {0};
 	k_timepoint_t end = sys_timepoint_calc(timeout);
-	ssize_t n;
 	int ret;
 
 	if (!atomic_get(&data->started)) {
@@ -1112,9 +1131,8 @@ int dronecan_dnia_request(const struct device *dev, k_timeout_t timeout)
 		return -EBUSY;
 	}
 
-	n = hwinfo_get_device_id(uid, sizeof(uid));
-	if (n <= 0) {
-		ret = n < 0 ? (int)n : -ENOTSUP;
+	ret = node_unique_id(uid);
+	if (ret != 0) {
 		goto out;
 	}
 
