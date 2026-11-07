@@ -761,6 +761,19 @@ static void hk_thread_fn(void *p1, void *p2, void *p3)
 	}
 }
 
+// GetNodeInfo
+#ifdef CONFIG_DRONECAN_SERVICE_GET_NODE_INFO
+#if CONFIG_DRONECAN_HW_PID != 0
+#define HW_PID CONFIG_DRONECAN_HW_PID
+#elif defined(CONFIG_CDC_ACM_SERIAL_PID)
+#define HW_PID CONFIG_CDC_ACM_SERIAL_PID
+#elif defined(CONFIG_USB_DEVICE_PID)
+#define HW_PID CONFIG_USB_DEVICE_PID
+#else
+#error "No product ID for the hardware version: set DRONECAN_HW_PID"
+#endif
+#endif
+
 // Init
 
 static int dronecan_init(const struct device *dev)
