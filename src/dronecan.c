@@ -777,6 +777,9 @@ static void hk_thread_fn(void *p1, void *p2, void *p3)
 #error "No product ID for the hardware version: set DRONECAN_HW_PID"
 #endif
 
+BUILD_ASSERT(sizeof(CONFIG_DRONECAN_NODE_NAME) > 1 && sizeof(CONFIG_DRONECAN_NODE_NAME) <= 81,
+		"DRONECAN_NODE_NAME has 1 to 80 characters");
+
 static const struct dronecan_msg_desc node_info_desc = {
 	.id = UAVCAN_PROTOCOL_GETNODEINFO_ID,
 	.signature = UAVCAN_PROTOCOL_GETNODEINFO_SIGNATURE,

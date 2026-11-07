@@ -53,12 +53,13 @@ config DRONECAN_NODE_NAME
 	  of a-z, 0-9, dot, dash and underscore.
 
 config DRONECAN_HW_PID
-	hex "USB product ID that gives the hardware revision"
+	hex "Product ID that gives the hardware revision"
+	range 0 0xFFFF
 	default 0
 	depends on DRONECAN_SERVICE_GET_NODE_INFO
 	help
-	  The high byte is the major version and the low byte, the minor one. 0 uses the product ID of the
-	  USB device (CDC_ACM_SERIAL_PID or USB_DEVICE_PID). Without USB, it has to be set.
+	  The high byte is the major version and the low byte, the minor one. If available, with 0 it uses the
+	  product ID of the USB device (CDC_ACM_SERIAL_PID or USB_DEVICE_PID). Without USB, it has to be set.
 
 # TODO
 # config DRONECAN_SERVICE_RESTART_NODE
