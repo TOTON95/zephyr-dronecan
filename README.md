@@ -15,7 +15,8 @@ Built on [libcanard](https://github.com/dronecan/libcanard/), with devicetree-co
 - Callback-based message and service subscription
 - Kconfig-selectable message set (so unused DSDL code is not built)
 - Optional shell commands (`CONFIG_DRONECAN_SHELL`): list nodes, show stats, monitor and subscribe to messages, publish test messages
-- *Planned:* GetNodeInfo, parameter get/set, RestartNode, firmware update
+- GetNodeInfo service (`CONFIG_DRONECAN_SERVICE_GET_NODE_INFO`)
+- *Planned:* parameter get/set, RestartNode, firmware update
 - *Planned:* shell commands that decode and print message fields, and publish messages from field values (today they take message names and raw hex bytes)
 
 ## Requirements
@@ -174,6 +175,20 @@ Handlers and subscription callbacks run in the receive thread with no lock held:
 - The request or message payload is valid only during the call. Keep `*sub` or `*svc` valid until
   the unsubscribe or unregister call returns.
 
+### GetNodeInfo
+
+With `CONFIG_DRONECAN_SERVICE_GET_NODE_INFO=y` the node answers GetNodeInfo, which tools such as the
+DroneCAN GUI Tool use to name and identify a node. A node that gets its ID from an allocator must
+have it. The answer is built from:
+
+| Field | Comes from |
+| --- | --- |
+| Name | `CONFIG_DRONECAN_NODE_NAME`: a reversed domain name such as `com.vendor.product`, with `a-z`, `0-9`, `.`, `-` and `_`, at most 80 characters (default `org.zephyrproject.dronecan`) |
+| Software version | `git describe` of the application directory: the latest tag `[v]MAJOR.MINOR...` and the first 8 digits of the commit. With no tag it is 0.0, so tag a release, for example `v0.1.0`. `-DDRONECAN_VERSION_GIT_DIR=<dir>` picks another directory |
+| Hardware version | `CONFIG_DRONECAN_HW_PID` (16 bits), or when it is 0 the product ID of the USB device in the build (`CDC_ACM_SERIAL_PID`). The high byte is the major version and the low byte the minor one, so `0x1186` is 17.134. A build without USB must set it |
+| Unique ID | The MCU serial number, padded with zeros. It is the same ID the node uses to ask for a node ID |
+| Status | The current health, mode, vendor status and uptime |
+
 ### Shell
 
 With `CONFIG_SHELL=y` and `CONFIG_DRONECAN_SHELL=y` the `dc` command is available. `<dev>` is the
@@ -223,6 +238,9 @@ An anonymous node (node ID 0) that asks an allocator on the bus for its node ID 
 flight controller or the DroneCAN GUI Tool, or another board running `samples/dronecan` (it enables
 the allocation server). On `native_sim` a second node plays the allocator.
 
+It also answers GetNodeInfo, as `org.zephyrproject.periph` on `native_sim` and as
+`com.3dr.cn1-periph` on the Control N1, so the node shows up by name in the DroneCAN GUI Tool.
+
 ```sh
 west build -b native_sim samples/dronecan_peripheral
 west build -b control_n1 samples/dronecan_peripheral
@@ -244,6 +262,7 @@ west twister -T tests -p native_sim
 | --- | --- |
 | `tests/core` | Start and stop, publishing, subscriptions, multi-frame delivery, NodeStatus and the node table, statistics |
 | `tests/dnia` | The allocation server and the allocation client |
+| `tests/node_info` | GetNodeInfo, asked by a separate libcanard client: name, versions, unique ID, status and uptime |
 | `tests/messages` | The message table and `Kconfig.messages` against the headers dronecan_dsdlc generates, for all messages |
 
 Only one node on a bus should be an allocator. The allocation server option applies to the whole
