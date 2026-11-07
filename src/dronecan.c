@@ -20,6 +20,7 @@
 #include <zephyr/sys/slist.h>
 
 #include <canard.h>
+#include <uavcan.protocol.GetNodeInfo.h>
 #include <uavcan.protocol.NodeStatus.h>
 #include <uavcan.protocol.dynamic_node_id.Allocation.h>
 
@@ -128,6 +129,9 @@ struct dronecan_data {
 #ifdef CONFIG_DRONECAN_DNIA_CLIENT
 	struct dnia_client dnia_cl;
 #endif
+#ifdef CONFIG_DRONECAN_SERVICE_GET_NODE_INFO
+	struct dronecan_service node_info;
+#endif
 
 	struct dronecan_stats stats;
 #ifdef CONFIG_DRONECAN_NODE_TABLE
@@ -143,7 +147,7 @@ static uint64_t canard_time_usec(void)
 	return k_ticks_to_us_floor64(k_uptime_ticks()) + 1U;
 }
 
-#ifdef CONFIG_DRONECAN_DNIA_CLIENT
+#if defined(CONFIG_DRONECAN_DNIA_CLIENT) || defined(CONFIG_DRONECAN_SERVICE_GET_NODE_INFO)
 // Unique ID for a node, the MCU serial number is padded with zeros.
 static int node_unique_id(uint8_t uid[NODE_UID_LEN])
 {
@@ -772,6 +776,54 @@ static void hk_thread_fn(void *p1, void *p2, void *p3)
 #else
 #error "No product ID for the hardware version: set DRONECAN_HW_PID"
 #endif
+
+static const struct dronecan_msg_desc node_info_desc = {
+	.id = UAVCAN_PROTOCOL_GETNODEINFO_ID,
+	.signature = UAVCAN_PROTOCOL_GETNODEINFO_SIGNATURE,
+	.max_size = UAVCAN_PROTOCOL_GETNODEINFO_REQUEST_MAX_SIZE,
+};
+
+static int node_info_cb(const struct device *dev, const struct dronecan_transfer *request,
+			void *response, uint16_t response_size, void *user_data)
+{
+	struct dronecan_data *data = dev->data;
+	struct uavcan_protocol_GetNodeInfoResponse rsp = {0};
+	uint8_t buf[UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_MAX_SIZE];
+	uint32_t len;
+	int ret;
+
+	ARG_UNUSED(request);
+	ARG_UNUSED(user_data);
+
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
+	node_status_fill(data, &rsp.status);
+	k_mutex_unlock(&data->canard_mtx);
+
+	rsp.software_version.major = DRONECAN_SW_MAJOR;
+	rsp.software_version.minor = DRONECAN_SW_MINOR;
+	if (DRONECAN_SW_VCS_COMMIT != 0) {
+		rsp.software_version.optional_field_flags =
+			UAVCAN_PROTOCOL_SOFTWAREVERSION_OPTIONAL_FIELD_FLAG_VCS_COMMIT;
+		rsp.software_version.vcs_commit = DRONECAN_SW_VCS_COMMIT;
+	}
+
+	rsp.hardware_version.major = HW_PID >> 8;
+	rsp.hardware_version.minor = HW_PID & 0xFF;
+	ret = node_unique_id(rsp.hardware_version.unique_id);
+	if (ret != 0) {
+		return ret;
+	}
+
+	rsp.name.len = sizeof(CONFIG_DRONECAN_NODE_NAME) - 1;
+	memcpy(rsp.name.data, CONFIG_DRONECAN_NODE_NAME, rsp.name.len);
+
+	len = uavcan_protocol_GetNodeInfoResponse_encode(&rsp, buf);
+	if (len > response_size) {
+		return -ENOSPC;
+	}
+	memcpy(response, buf, len);
+	return len;
+}
 #endif
 
 // Init
@@ -815,6 +867,15 @@ static int dronecan_init(const struct device *dev)
 
 	LOG_DBG("%s: node %u on %s, arena %zu bytes", dev->name, cfg->node_id,
 		cfg->can_bus[0]->name, cfg->arena_size);
+
+#ifdef CONFIG_DRONECAN_SERVICE_GET_NODE_INFO
+	int ret = dronecan_register_service(dev, &data->node_info, &node_info_desc, node_info_cb,
+					    NULL);
+	if (ret != 0) {
+		LOG_ERR("%s: GetNodeInfo registration failed: %d", dev->name, ret);
+		return ret;
+	}
+#endif
 
 	return 0;
 }
