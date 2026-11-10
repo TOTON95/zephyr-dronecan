@@ -4,6 +4,7 @@
  */
 
 #include <math.h>
+#include <string.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -19,7 +20,8 @@ LOG_MODULE_REGISTER(dronecan_sensor_sample, LOG_LEVEL_INF);
 
 static const struct device *const dc = DEVICE_DT_GET(DT_NODELABEL(dronecan0));
 
-#define TICK_MS 50 // air data every tick (20 Hz), battery and range every other tick (10 Hz)
+// Air data every tick (20 Hz), range every other tick (10 Hz), battery every 20th tick (1 Hz)
+#define TICK_MS 50
 
 static const struct dronecan_msg_desc battery_desc = {
 	.id = UAVCAN_EQUIPMENT_POWER_BATTERYINFO_ID,
@@ -189,9 +191,10 @@ int main(void)
 
 		send_air_data(t);
 		if (tick % 2 == 0) {
-			send_battery(t);
-		} else {
 			send_range(t);
+		}
+		if (tick % 20 == 1) { 
+			send_battery(t);
 		}
 
 		if (tick % 40 == 39) { // every 2 s
