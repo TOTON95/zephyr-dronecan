@@ -20,6 +20,7 @@
 #include <zephyr/sys/slist.h>
 
 #include <canard.h>
+#include <uavcan.protocol.GetNodeInfo.h>
 #include <uavcan.protocol.NodeStatus.h>
 #include <uavcan.protocol.dynamic_node_id.Allocation.h>
 
@@ -47,8 +48,9 @@ struct dronecan_pub {
 	uint8_t transfer_id;
 };
 
+#define NODE_UID_LEN 16
 #if defined(CONFIG_DRONECAN_DNIA_SERVER) || defined(CONFIG_DRONECAN_DNIA_CLIENT)
-#define DNIA_UID_LEN 16
+#define DNIA_UID_LEN NODE_UID_LEN
 #endif
 
 #ifdef CONFIG_DRONECAN_DNIA_SERVER
@@ -127,6 +129,9 @@ struct dronecan_data {
 #ifdef CONFIG_DRONECAN_DNIA_CLIENT
 	struct dnia_client dnia_cl;
 #endif
+#ifdef CONFIG_DRONECAN_SERVICE_GET_NODE_INFO
+	struct dronecan_service node_info;
+#endif
 
 	struct dronecan_stats stats;
 #ifdef CONFIG_DRONECAN_NODE_TABLE
@@ -141,6 +146,20 @@ static uint64_t canard_time_usec(void)
 {
 	return k_ticks_to_us_floor64(k_uptime_ticks()) + 1U;
 }
+
+#if defined(CONFIG_DRONECAN_DNIA_CLIENT) || defined(CONFIG_DRONECAN_SERVICE_GET_NODE_INFO)
+// Unique ID for a node, the MCU serial number is padded with zeros.
+static int node_unique_id(uint8_t uid[NODE_UID_LEN])
+{
+	ssize_t n;
+	memset(uid, 0, NODE_UID_LEN);
+	n = hwinfo_get_device_id(uid, NODE_UID_LEN);
+	if (n <= 0) {
+		return n < 0 ? (int)n : -ENOTSUP;
+	}
+	return 0;
+}
+#endif //CONFIG_DRONECAN_DNIA_CLIENT
 
 // Signature of a message somebody subscribed to, or of a service that has a handler.
 static bool find_signature(struct dronecan_data *data, uint16_t id, bool request,
@@ -691,6 +710,15 @@ static const struct dronecan_msg_desc node_status_desc = {
 	.max_size = UAVCAN_PROTOCOL_NODESTATUS_MAX_SIZE,
 };
 
+// Call with canard_mtx, keeps health, mode and vendor status consistent.
+static void node_status_fill(struct dronecan_data *data, struct uavcan_protocol_NodeStatus *ns)
+{
+	ns->health = data->health;
+	ns->mode = data->mode;
+	ns->vendor_specific_status_code = data->vendor_status;
+	ns->uptime_sec = k_uptime_get_32() / 1000U;
+}
+
 // Broadcasts NodeStatus and drops stale partial transfers.
 static void hk_thread_fn(void *p1, void *p2, void *p3)
 {
@@ -713,12 +741,9 @@ static void hk_thread_fn(void *p1, void *p2, void *p3)
 		uint8_t buf[UAVCAN_PROTOCOL_NODESTATUS_MAX_SIZE];
 		uint8_t node_id;
 
-		// One critical section, so health, mode and vendor status are consistent.
 		k_mutex_lock(&data->canard_mtx, K_FOREVER);
 		node_id = canardGetLocalNodeID(&data->canard);
-		ns.health = data->health;
-		ns.mode = data->mode;
-		ns.vendor_specific_status_code = data->vendor_status;
+		node_status_fill(data, &ns);
 		canardCleanupStaleTransfers(&data->canard, canard_time_usec());
 		k_mutex_unlock(&data->canard_mtx);
 
@@ -730,7 +755,6 @@ static void hk_thread_fn(void *p1, void *p2, void *p3)
 			continue; // anonymous nodes must not broadcast NodeStatus
 		}
 
-		ns.uptime_sec = k_uptime_get_32() / 1000U;
 		uint32_t len = uavcan_protocol_NodeStatus_encode(&ns, buf);
 		int ret = dronecan_broadcast(dev, &node_status_desc, DRONECAN_PRIORITY_LOW, buf,
 					     len);
@@ -740,6 +764,70 @@ static void hk_thread_fn(void *p1, void *p2, void *p3)
 		}
 	}
 }
+
+// GetNodeInfo
+#ifdef CONFIG_DRONECAN_SERVICE_GET_NODE_INFO
+#if CONFIG_DRONECAN_HW_PID != 0
+#define HW_PID CONFIG_DRONECAN_HW_PID
+#elif defined(CONFIG_CDC_ACM_SERIAL_PID)
+#define HW_PID CONFIG_CDC_ACM_SERIAL_PID
+#elif defined(CONFIG_USB_DEVICE_PID)
+#define HW_PID CONFIG_USB_DEVICE_PID
+#else
+#error "No product ID for the hardware version: set DRONECAN_HW_PID"
+#endif
+
+BUILD_ASSERT(sizeof(CONFIG_DRONECAN_NODE_NAME) > 1 && sizeof(CONFIG_DRONECAN_NODE_NAME) <= 81,
+		"DRONECAN_NODE_NAME has 1 to 80 characters");
+
+static const struct dronecan_msg_desc node_info_desc = {
+	.id = UAVCAN_PROTOCOL_GETNODEINFO_ID,
+	.signature = UAVCAN_PROTOCOL_GETNODEINFO_SIGNATURE,
+	.max_size = UAVCAN_PROTOCOL_GETNODEINFO_REQUEST_MAX_SIZE,
+};
+
+static int node_info_cb(const struct device *dev, const struct dronecan_transfer *request,
+			void *response, uint16_t response_size, void *user_data)
+{
+	struct dronecan_data *data = dev->data;
+	struct uavcan_protocol_GetNodeInfoResponse rsp = {0};
+	uint8_t buf[UAVCAN_PROTOCOL_GETNODEINFO_RESPONSE_MAX_SIZE];
+	uint32_t len;
+	int ret;
+
+	ARG_UNUSED(request);
+	ARG_UNUSED(user_data);
+
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
+	node_status_fill(data, &rsp.status);
+	k_mutex_unlock(&data->canard_mtx);
+
+	rsp.software_version.major = DRONECAN_SW_MAJOR;
+	rsp.software_version.minor = DRONECAN_SW_MINOR;
+	if (DRONECAN_SW_VCS_COMMIT != 0) {
+		rsp.software_version.optional_field_flags =
+			UAVCAN_PROTOCOL_SOFTWAREVERSION_OPTIONAL_FIELD_FLAG_VCS_COMMIT;
+		rsp.software_version.vcs_commit = DRONECAN_SW_VCS_COMMIT;
+	}
+
+	rsp.hardware_version.major = HW_PID >> 8;
+	rsp.hardware_version.minor = HW_PID & 0xFF;
+	ret = node_unique_id(rsp.hardware_version.unique_id);
+	if (ret != 0) {
+		return ret;
+	}
+
+	rsp.name.len = sizeof(CONFIG_DRONECAN_NODE_NAME) - 1;
+	memcpy(rsp.name.data, CONFIG_DRONECAN_NODE_NAME, rsp.name.len);
+
+	len = uavcan_protocol_GetNodeInfoResponse_encode(&rsp, buf);
+	if (len > response_size) {
+		return -ENOSPC;
+	}
+	memcpy(response, buf, len);
+	return len;
+}
+#endif
 
 // Init
 
@@ -782,6 +870,15 @@ static int dronecan_init(const struct device *dev)
 
 	LOG_DBG("%s: node %u on %s, arena %zu bytes", dev->name, cfg->node_id,
 		cfg->can_bus[0]->name, cfg->arena_size);
+
+#ifdef CONFIG_DRONECAN_SERVICE_GET_NODE_INFO
+	int ret = dronecan_register_service(dev, &data->node_info, &node_info_desc, node_info_cb,
+					    NULL);
+	if (ret != 0) {
+		LOG_ERR("%s: GetNodeInfo registration failed: %d", dev->name, ret);
+		return ret;
+	}
+#endif
 
 	return 0;
 }
@@ -1099,7 +1196,6 @@ int dronecan_dnia_request(const struct device *dev, k_timeout_t timeout)
 	struct dnia_client *c = &data->dnia_cl;
 	uint8_t uid[DNIA_UID_LEN] = {0};
 	k_timepoint_t end = sys_timepoint_calc(timeout);
-	ssize_t n;
 	int ret;
 
 	if (!atomic_get(&data->started)) {
@@ -1112,9 +1208,8 @@ int dronecan_dnia_request(const struct device *dev, k_timeout_t timeout)
 		return -EBUSY;
 	}
 
-	n = hwinfo_get_device_id(uid, sizeof(uid));
-	if (n <= 0) {
-		ret = n < 0 ? (int)n : -ENOTSUP;
+	ret = node_unique_id(uid);
+	if (ret != 0) {
 		goto out;
 	}
 

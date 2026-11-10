@@ -33,6 +33,9 @@ jobs:
       - name: Check the generated message files
         run: python3 zephyr-dronecan/scripts/gen_kconfig_messages.py --check lib/DSDL
 
+      - name: Test the version of the node
+        run: cmake -P zephyr-dronecan/cmake/test_version.cmake
+
       - name: Build the samples
         run: |
           for sample in dronecan dronecan_shell dronecan_peripheral; do

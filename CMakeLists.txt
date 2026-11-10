@@ -122,4 +122,23 @@ if(CONFIG_DRONECAN)
 
   zephyr_library_sources_ifdef(CONFIG_DRONECAN_SHELL src/dronecan_shell.c src/dronecan_msg_table.c)
 
+  if(CONFIG_DRONECAN_SERVICE_GET_NODE_INFO)
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/dronecan_version.cmake)
+
+    if(NOT CONFIG_DRONECAN_NODE_NAME MATCHES "^[a-z0-9._-]+$")
+      message(FATAL_ERROR
+        "DRONECAN_NODE_NAME \"${CONFIG_DRONECAN_NODE_NAME}\" can only have a-z, 0-9, '.', '-', and '_'")
+    endif()
+
+    # Software version is from the application, might change later, it might require discussion
+    set(DRONECAN_VERSION_GIT_DIR ${APPLICATION_SOURCE_DIR} CACHE PATH
+        "Directory whose git version GetNodeInfo reports")
+    dronecan_git_version(${DRONECAN_VERSION_GIT_DIR} sw_major sw_minor sw_commit)
+    zephyr_library_compile_definitions(
+      DRONECAN_SW_MAJOR=${sw_major}
+      DRONECAN_SW_MINOR=${sw_minor}
+      DRONECAN_SW_VCS_COMMIT=${sw_commit}U
+    )
+  endif() # CONFIG_DRONECAN_SERVICE_GET_NODE_INFO
+
 endif() # CONFIG_DRONECAN

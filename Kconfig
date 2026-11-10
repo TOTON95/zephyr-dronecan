@@ -36,10 +36,32 @@ config DRONECAN_DNIA_CLIENT
 	help
 	  Request a node ID from an allocator, using the hardware unique ID (like a peripheral).
 
+config DRONECAN_SERVICE_GET_NODE_INFO
+	bool "uavcan.protocol.GetNodeInfo service"
+	select HWINFO
+	help
+	  Answer to GetNodeInfo requests with the node's status, software version (git),
+	  hardware version (for e.g. USB PID), unique ID (the MCU serial number) and name.
+	  Nodes that get their ID dynamically must support it.
+
+config DRONECAN_NODE_NAME
+	string "Node name"
+	default "org.zephyrproject.dronecan"
+	depends on DRONECAN_SERVICE_GET_NODE_INFO
+	help
+	  It needs to be a reversed domain name, for e.g. com.vendor.product. 1 to 80 characters out
+	  of a-z, 0-9, dot, dash and underscore.
+
+config DRONECAN_HW_PID
+	hex "Product ID that gives the hardware revision"
+	range 0 0xFFFF
+	default 0
+	depends on DRONECAN_SERVICE_GET_NODE_INFO
+	help
+	  The high byte is the major version and the low byte, the minor one. If available, with 0 it uses the
+	  product ID of the USB device (CDC_ACM_SERIAL_PID or USB_DEVICE_PID). Without USB, it has to be set.
+
 # TODO
-# config DRONECAN_SERVICE_GET_NODE_INFO
-# 	bool "uavcan.protocol.GetNodeInfo service"
-# 
 # config DRONECAN_SERVICE_RESTART_NODE
 # 	bool "uavcan.protocol.RestartNode service"
 # 
