@@ -61,10 +61,24 @@ config DRONECAN_HW_PID
 	  The high byte is the major version and the low byte, the minor one. If available, with 0 it uses the
 	  product ID of the USB device (CDC_ACM_SERIAL_PID or USB_DEVICE_PID). Without USB, it has to be set.
 
+config DRONECAN_SERVICE_RESTART_NODE
+	bool "uavcan.protocol.RestartNode service"
+	select REBOOT
+	help
+	  Answer RestartNode requests. A node resets the MCU after
+	  DRONECAN_RESTART_DELAY_MS. An application can refuse a restart,
+	  for example while it is armed.
+
+config DRONECAN_RESTART_DELAY_MS
+	int "Delay between the answer and the restart (ms)"
+	range 10 5000
+	default 500
+	depends on DRONECAN_SERVICE_RESTART_NODE
+	help
+	  Time the node keeps running after it answers a restart request, so that the
+	  answer leaves the bus before the MCU resets.
+
 # TODO
-# config DRONECAN_SERVICE_RESTART_NODE
-# 	bool "uavcan.protocol.RestartNode service"
-# 
 # config DRONECAN_SERVICE_PARAM
 # 	bool "uavcan.protocol.param services (GetSet, ExecuteOpcode)"
 # 
