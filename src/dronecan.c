@@ -17,11 +17,13 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/sys/slist.h>
 
 #include <canard.h>
 #include <uavcan.protocol.GetNodeInfo.h>
 #include <uavcan.protocol.NodeStatus.h>
+#include <uavcan.protocol.RestartNode.h>
 #include <uavcan.protocol.dynamic_node_id.Allocation.h>
 
 LOG_MODULE_REGISTER(dronecan, CONFIG_DRONECAN_LOG_LEVEL);
@@ -131,6 +133,12 @@ struct dronecan_data {
 #endif
 #ifdef CONFIG_DRONECAN_SERVICE_GET_NODE_INFO
 	struct dronecan_service node_info;
+#endif
+#ifdef CONFIG_DRONECAN_SERVICE_RESTART_NODE
+	struct dronecan_service restart;
+	struct k_work_delayable restart_work;
+	dronecan_restart_cb_t restart_cb; // canard_mtx
+	void *restart_user_data; // canard_mtx
 #endif
 
 	struct dronecan_stats stats;
@@ -829,6 +837,87 @@ static int node_info_cb(const struct device *dev, const struct dronecan_transfer
 }
 #endif
 
+// RestartNode
+#ifdef CONFIG_DRONECAN_SERVICE_RESTART_NODE
+static const struct dronecan_msg_desc restart_desc = {
+	.id = UAVCAN_PROTOCOL_RESTARTNODE_ID,
+	.signature = UAVCAN_PROTOCOL_RESTARTNODE_SIGNATURE,
+	.max_size = UAVCAN_PROTOCOL_RESTARTNODE_REQUEST_MAX_SIZE,
+};
+
+#define RESTART_MAGIC_LEN 5
+
+// The magic number is a uint40, least significant byte first.
+static uint64_t read_magic_num(const uint8_t *p)
+{
+	return (uint64_t)p[0] | (uint64_t)p[1] << 8 | (uint64_t)p[2] << 16 | (uint64_t)p[3] << 24 |
+		(uint64_t)p[4] << 32;
+}
+
+void __weak dronecan_restart_now(const struct device *dev)
+{
+	ARG_UNUSED(dev);
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
+static void restart_work_fn(struct k_work *work)
+{
+	struct dronecan_data *data =
+		CONTAINER_OF(k_work_delayable_from_work(work), struct dronecan_data, restart_work);
+
+	LOG_WRN("%s: restarting...", data->dev->name);
+	dronecan_restart_now(data->dev);
+}
+
+void dronecan_set_restart_handler(const struct device *dev, dronecan_restart_cb_t cb,
+				  void *user_data)
+{
+	struct dronecan_data *data = dev->data;
+
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
+	data->restart_cb = cb;
+	data->restart_user_data = user_data;
+	k_mutex_unlock(&data->canard_mtx);
+}
+
+static int restart_service_cb(const struct device *dev, const struct dronecan_transfer *request,
+			      void *response, uint16_t response_size, void *user_data)
+{
+	struct dronecan_data *data = dev->data;
+	struct uavcan_protocol_RestartNodeResponse rsp = {0};
+	uint8_t buf[UAVCAN_PROTOCOL_RESTARTNODE_RESPONSE_MAX_SIZE];
+	dronecan_restart_cb_t cb;
+	void *cb_data;
+	uint32_t len;
+
+	ARG_UNUSED(user_data);
+
+	// Request is too short / different magic number -> wrong
+	if (request->payload_len >= RESTART_MAGIC_LEN &&
+	    read_magic_num(request->payload) == UAVCAN_PROTOCOL_RESTARTNODE_REQUEST_MAGIC_NUMBER) {
+		// Magic number matches
+		k_mutex_lock(&data->canard_mtx, K_FOREVER);
+		cb = data->restart_cb;
+		cb_data = data->restart_user_data;
+		k_mutex_unlock(&data->canard_mtx);
+
+		if (cb == NULL || cb(dev, cb_data) == 0) {
+			rsp.ok = true;
+			// A second request while one is pending keeps the first time
+			k_work_schedule(&data->restart_work,
+					K_MSEC(CONFIG_DRONECAN_RESTART_DELAY_MS));
+		}
+	}
+
+	len = uavcan_protocol_RestartNodeResponse_encode(&rsp, buf);
+	if (len > response_size) {
+		return -ENOSPC;
+	}
+	memcpy(response, buf, len);
+	return len;
+}
+#endif // CONFIG_DRONECAN_SERVICE_RESTART_NODE
+
 // Init
 
 static int dronecan_init(const struct device *dev)
@@ -877,6 +966,18 @@ static int dronecan_init(const struct device *dev)
 	if (ret != 0) {
 		LOG_ERR("%s: GetNodeInfo registration failed: %d", dev->name, ret);
 		return ret;
+	}
+#endif
+#ifdef CONFIG_DRONECAN_SERVICE_RESTART_NODE
+	k_work_init_delayable(&data->restart_work, restart_work_fn);
+	{
+		int rret = dronecan_register_service(dev, &data->restart, &restart_desc,
+						     restart_service_cb, NULL);
+
+		if (rret != 0) {
+			LOG_ERR("%s: RestartNode registration failed: %d", dev->name, rret);
+			return rret;
+		}
 	}
 #endif
 
