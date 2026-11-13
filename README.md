@@ -16,7 +16,8 @@ Built on [libcanard](https://github.com/dronecan/libcanard/), with devicetree-co
 - Kconfig-selectable message set (so unused DSDL code is not built)
 - Optional shell commands (`CONFIG_DRONECAN_SHELL`): list nodes, show stats, monitor and subscribe to messages, publish test messages
 - GetNodeInfo service (`CONFIG_DRONECAN_SERVICE_GET_NODE_INFO`)
-- *Planned:* parameter get/set, RestartNode, firmware update
+- RestartNode service (`CONFIG_DRONECAN_SERVICE_RESTART_NODE`)
+- *Planned:* parameter get/set, firmware update
 - *Planned:* shell commands that decode and print message fields, and publish messages from field values (today they take message names and raw hex bytes)
 
 ## Requirements
@@ -167,7 +168,7 @@ Handlers and subscription callbacks run in the receive thread with no lock held:
 
 - Keep them short. They delay all reception of the node, and the receive queue
   (`DRONECAN_RX_MSGQ_SIZE` frames) can overflow. Hand slow work, such as a flash write, to another
-  threadd.
+  thread.
 
 - They may call `dronecan_broadcast()`, but not `dronecan_stop()` or the unsubscribe and
   unregister calls: those wait for a running callback, so they would wait for themselves.
@@ -188,6 +189,20 @@ have it. The answer is built from:
 | Hardware version | `CONFIG_DRONECAN_HW_PID` (16 bits), or when it is 0 the product ID of the USB device in the build (`CDC_ACM_SERIAL_PID`). The high byte is the major version and the low byte the minor one, so `0x1186` is 17.134. A build without USB must set it |
 | Unique ID | The MCU serial number, padded with zeros. It is the same ID the node uses to ask for a node ID |
 | Status | The current health, mode, vendor status and uptime |
+
+### RestartNode
+
+With `CONFIG_DRONECAN_SERVICE_RESTART_NODE=y` the node answers RestartNode, the request behind the
+Restart button of the DroneCAN GUI Tool. A wrong magic number or a short request gets `ok = false`.
+
+With the right number, the node asks the callback set with `dronecan_set_restart_handler()`: 0
+accepts, a negative error code refuses (for example while armed), and no callback always accepts.
+A refusal gets `ok = false`. An acceptance gets `ok = true`, and the node resets the MCU
+`CONFIG_DRONECAN_RESTART_DELAY_MS` later (500 ms by default), so the answer leaves the bus first.
+An accepted restart is final: `dronecan_stop()` does not cancel it.
+
+The reset is `sys_reboot(SYS_REBOOT_COLD)`. A board or a test can replace it by defining the weak
+function `dronecan_restart_now()`.
 
 ### Shell
 
@@ -240,6 +255,7 @@ the allocation server). On `native_sim` a second node plays the allocator.
 
 It also answers GetNodeInfo, as `org.zephyrproject.periph` on `native_sim` and as
 `com.3dr.cn1-periph` on the Control N1, so the node shows up by name in the DroneCAN GUI Tool.
+It answers RestartNode too.
 
 ```sh
 west build -b native_sim samples/dronecan_peripheral
@@ -279,6 +295,8 @@ west twister -T tests -p native_sim
 | `tests/core` | Start and stop, publishing, subscriptions, multi-frame delivery, NodeStatus and the node table, statistics |
 | `tests/dnia` | The allocation server and the allocation client |
 | `tests/node_info` | GetNodeInfo, asked by a separate libcanard client: name, versions, unique ID, status and uptime |
+| `tests/restart` | RestartNode, asked by a separate libcanard client: accept, refuse, wrong magic number, short request, repeated requests, stop |
+| `tests/services` | The service registry: registration, single and multi-frame requests, handler errors, requests for other nodes, unregister, priorities |
 | `tests/messages` | The message table and `Kconfig.messages` against the headers dronecan_dsdlc generates, for all messages |
 
 Only one node on a bus should be an allocator. The allocation server option applies to the whole
