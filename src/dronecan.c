@@ -864,8 +864,9 @@ static void restart_work_fn(struct k_work *work)
 {
 	struct dronecan_data *data =
 		CONTAINER_OF(k_work_delayable_from_work(work), struct dronecan_data, restart_work);
+	const struct dronecan_config *cfg = data->dev->config;
 
-	LOG_WRN("%s: restarting...", data->dev->name);
+	LOG_WRN("%s on %s: restarting...", data->dev->name, cfg->can_bus[0]->name);
 	dronecan_restart_now(data->dev);
 }
 
@@ -883,12 +884,14 @@ void dronecan_set_restart_handler(const struct device *dev, dronecan_restart_cb_
 static int restart_service_cb(const struct device *dev, const struct dronecan_transfer *request,
 			      void *response, uint16_t response_size, void *user_data)
 {
+	const struct dronecan_config *cfg = dev->config;
 	struct dronecan_data *data = dev->data;
 	struct uavcan_protocol_RestartNodeResponse rsp = {0};
 	uint8_t buf[UAVCAN_PROTOCOL_RESTARTNODE_RESPONSE_MAX_SIZE];
 	dronecan_restart_cb_t cb;
 	void *cb_data;
 	uint32_t len;
+	int ret;
 
 	ARG_UNUSED(user_data);
 
@@ -901,11 +904,18 @@ static int restart_service_cb(const struct device *dev, const struct dronecan_tr
 		cb_data = data->restart_user_data;
 		k_mutex_unlock(&data->canard_mtx);
 
-		if (cb == NULL || cb(dev, cb_data) == 0) {
+		ret = (cb == NULL) ? 0 : cb(dev, cb_data);
+		if (ret == 0) {
 			rsp.ok = true;
+			LOG_WRN("%s on %s: restart requested by node %u, in %d ms", dev->name,
+				cfg->can_bus[0]->name, request->source_node_id,
+				CONFIG_DRONECAN_RESTART_DELAY_MS);
 			// A second request while one is pending keeps the first time
 			k_work_schedule(&data->restart_work,
 					K_MSEC(CONFIG_DRONECAN_RESTART_DELAY_MS));
+		} else {
+			LOG_INF("%s on %s: restart requested by node %u, refused: %d", dev->name,
+				cfg->can_bus[0]->name, request->source_node_id, ret);
 		}
 	}
 
