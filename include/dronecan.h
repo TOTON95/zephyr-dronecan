@@ -152,6 +152,24 @@ void dronecan_get_stats(const struct device *dev, struct dronecan_stats *out);
 // Blocks until an allocator grants this anonymous node an ID, and uses it.
 int dronecan_dnia_request(const struct device *dev, k_timeout_t timeout);
 
+#ifdef CONFIG_DRONECAN_SERVICE_RESTART_NODE
+
+// Called in the receive thread when a RestartNode request is received and the magic number matches.
+// Returns:
+// 0 -> accept: the node answers ok and restarts after CONFIG_DRONECAN_RESTART_DELAY_MS
+// -ERRNO -> refuse: the node answers ok = false and does not restart
+// Once accepted, the restart is not cancelled, not even by dronecan_stop().
+typedef int (*dronecan_restart_cb_t)(const struct device *dev, void *user_data);
+
+// Sets the callback that accepts or refuses a restart. Without one, the node always accepts.
+void dronecan_set_restart_handler(const struct device *dev, dronecan_restart_cb_t cb,
+				  void *user_data);
+
+// The restart function, called after the delay. Restarts the MCU.
+// Defined as weak, so a board or a test can replace it.
+void dronecan_restart_now(const struct device *dev);
+#endif // CONFIG_DRONECAN_SERVICE_RESTART_NODE
+
 #ifdef __cplusplus
 }
 #endif // __cplusplus
