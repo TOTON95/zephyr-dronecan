@@ -78,10 +78,18 @@ config DRONECAN_RESTART_DELAY_MS
 	  Time the node keeps running after it answers a restart request, so that the
 	  answer leaves the bus before the MCU resets.
 
+config DRONECAN_SERVICE_PARAM
+	bool "uavcan.protocol.param services (GetSet, ExecuteOpcode)"
+	depends on SENSOR
+	select SETTINGS
+	help
+	  Answer parameter requests. The parameters are the attributes of
+	  the sensors in the devicetree: every enabled sensor with a driver the
+	  module knows is included, and a zephyr,dronecan-sensor child node of
+	  the DroneCAN node changes or adds one. Extra parameters are declared as
+	  zephyr,dronecan-param children.
+
 # TODO
-# config DRONECAN_SERVICE_PARAM
-# 	bool "uavcan.protocol.param services (GetSet, ExecuteOpcode)"
-# 
 # config DRONECAN_PERIPHERAL
 # 	bool "Peripheral node role"
 # 	select DRONECAN_DNIA_CLIENT

@@ -1,0 +1,51 @@
+# Copyright (c) 2026 3DR, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Overrides the DroneCAN parameters of a sensor, or adds a sensor the module does
+  not know.
+  Must be child of a zephyr,dronecan node. Every enabled sensor with a driver the
+  module knows already gets parameters without this node. Each parameter is named
+  <name>.<channel>.<attribute>.
+  For example imu1.accel_xyz.full_scale. Values use the units of the Zephyr sensor
+  API (m/s^2, rad/s, G, kPa, degrees Celsius).
+
+compatible: "zephyr,dronecan-sensor"
+
+include: "base.yaml"
+
+properties:
+  sensor:
+    type: phandle
+    required: true
+    description: A DroneCAN sensor device.
+
+  channels:
+    type: string-array
+    description: |
+      Channels that get parameters. Optional for a sensor the module knows,
+      it replaces the known list. Required for any other sensor.
+    enum:
+      - "accel_xyz"
+      - "gyro_xyz"
+      - "magn_xyz"
+      - "press"
+      - "ambient_temp"
+      - "die_temp"
+      - "distance"
+      - "voltage"
+      - "current"
+
+  attributes:
+    type: string-array
+    description: |
+      Attributes offered per channel. Without it, all of them are tried at start and
+      the ones the driver rejects are left out.
+    enum:
+      - "sampling_frequency"
+      - "oversampling"
+      - "full_scale"
+      - "offset"
+      - "lower_thresh"
+      - "upper_thresh"
+      - "hysteresis"

@@ -1,0 +1,33 @@
+# Copyright (c) 2026 3DR, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  An extra DroneCAN parameter, not backed by a sensor attribute. Must be a child
+  of a zephyr,dronecan node.
+
+compatible: "zephyr,dronecan-param"
+
+include: base.yaml
+
+properties:
+  param-name:
+    type: string
+    required: true
+    description: Name of the parameter, up to 92 characters.
+
+  type:
+    type: string
+    required: true
+    enum: ["integer", "real", "boolean"]
+
+  default-value:
+    type: array
+    required: true
+    description: |
+      <val1 val2>, like struct sensor_value. Boolean uses val1 only.
+
+  min-value:
+    type: array
+
+  max-value:
+    type: array
