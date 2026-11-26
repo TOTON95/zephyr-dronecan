@@ -70,8 +70,14 @@ struct dronecan_subscription {
 	void *user_data;
 };
 
+// A handler returns this when it cannot answer yet, see dronecan_service_cb_t
+#define DRONECAN_SERVICE_DEFERRED (-EINPROGRESS)
+
 // Handler of a service. Fills the response (at most response_size bytes) and returns its
 // length, or a negative errno to send no response.
+// A handler that cannot answer yet returns DRONECAN_SERVICE_DEFERRED. It has to copy the request
+// (struct dronecan_transfer, the payload is not kept), and answer with dronecan_service_respond()
+// when it is done. Meanwhile the node keeps handling other requests.
 typedef int (*dronecan_service_cb_t)(const struct device *dev,
 				     const struct dronecan_transfer *request, void *response,
 				     uint16_t response_size, void *user_data);
@@ -144,6 +150,12 @@ int dronecan_register_service(const struct device *dev, struct dronecan_service 
 			      const struct dronecan_msg_desc *desc, dronecan_service_cb_t cb,
 			      void *user_data);
 int dronecan_unregister_service(const struct device *dev, struct dronecan_service *svc);
+
+// Answer a request whose handler returned DRONECAN_SERVICE_DEFERRED, from any thread. The request
+// is the copy the handler kept. Returns -ENOENT if the service was unregistered meanwhile,
+// -ENOTCONN if the node is stopped and -EMSGSIZE if the response is too large.
+int dronecan_service_respond(const struct device *dev, const struct dronecan_transfer *request,
+			     const void *response, uint16_t len);
 
 // Node table and statistics
 int dronecan_get_node(const struct device *dev, uint8_t id, struct dronecan_node_entry *out);

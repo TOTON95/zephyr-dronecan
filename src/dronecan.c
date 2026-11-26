@@ -496,6 +496,34 @@ static void dispatch_rx(const struct device *dev)
 BUILD_ASSERT(CONFIG_DRONECAN_MAX_SERVICE_RESPONSE <= UINT16_MAX,
 	     "the handler gets the response size as 16 bits");
 
+// Queue the response to a request and wake the sender.
+static int send_response(struct dronecan_data *data,
+			 const struct dronecan_transfer *req,
+			 uint64_t signature,
+			 const void *response,
+			 uint16_t len)
+{
+	// the response carries the request's ID
+	uint8_t transfer_id = req->transfer_id;
+	int16_t ret;
+
+	k_mutex_lock(&data->canard_mtx, K_FOREVER);
+	ret = canardRequestOrRespond(&data->canard, req->source_node_id,
+				     signature, req->data_type_id,
+				     &transfer_id, req->priority,
+				     CanardResponse, response, len);
+	k_mutex_unlock(&data->canard_mtx);
+
+	if (ret < 0) {
+		data->stats.svc_errors++;
+		LOG_DBG("response failed: %d", ret);
+		return -ENOMEM;
+	}
+	data->stats.svc_responses++;
+	k_work_submit_to_queue(&data->tx_workq, &data->tx_work);
+	return 0;
+}
+
 // Call the handler of the queued request and send its response. No lock is held while it runs.
 static void dispatch_service(const struct device *dev)
 {
@@ -505,9 +533,7 @@ static void dispatch_service(const struct device *dev)
 	dronecan_service_cb_t cb = NULL;
 	void *user_data = NULL;
 	uint64_t signature = 0;
-	uint8_t transfer_id = req->transfer_id; // the response carries the request's ID
 	int len;
-	int16_t ret;
 
 	k_mutex_lock(&data->sub_mtx, K_FOREVER);
 	SYS_SLIST_FOR_EACH_CONTAINER(&data->services, svc, node) {
@@ -532,24 +558,15 @@ static void dispatch_service(const struct device *dev)
 	k_condvar_broadcast(&data->sub_cv);
 	k_mutex_unlock(&data->sub_mtx);
 
+	if (len == DRONECAN_SERVICE_DEFERRED) {
+		return; // the handler answers later
+	}
+
 	if (len < 0 || len > sizeof(data->svc_response)) {
 		data->stats.svc_errors++;
 		return;
 	}
-
-	k_mutex_lock(&data->canard_mtx, K_FOREVER);
-	ret = canardRequestOrRespond(&data->canard, req->source_node_id, signature,
-				     req->data_type_id, &transfer_id, req->priority, CanardResponse,
-				     data->svc_response, len);
-	k_mutex_unlock(&data->canard_mtx);
-
-	if (ret < 0) {
-		data->stats.svc_errors++;
-		LOG_DBG("response failed: %d", ret);
-		return;
-	}
-	data->stats.svc_responses++;
-	k_work_submit_to_queue(&data->tx_workq, &data->tx_work);
+	send_response(data, req, signature, data->svc_response, len);
 }
 
 // TX path
@@ -1507,6 +1524,29 @@ int dronecan_unregister_service(const struct device *dev, struct dronecan_servic
 	}
 	k_mutex_unlock(&data->sub_mtx);
 	return 0;
+}
+
+int dronecan_service_respond(const struct device *dev,
+			     const struct dronecan_transfer *request,
+			     const void *response, uint16_t len)
+{
+	struct dronecan_data *data = dev->data;
+	uint64_t signature;
+
+	if (request == NULL || (response == NULL && len > 0)) {
+		return -EINVAL;
+	}
+	if (len > CONFIG_DRONECAN_MAX_SERVICE_RESPONSE) {
+		return -EMSGSIZE;
+	}
+	if (!atomic_get(&data->started)) {
+		return -ENOTCONN;
+	}
+	if (!find_signature(data, request->data_type_id, true, &signature)) {
+		return -ENOENT;
+	}
+
+	return send_response(data, request, signature, response, len);
 }
 
 // Instances

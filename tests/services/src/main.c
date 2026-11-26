@@ -390,3 +390,152 @@ ZTEST(dronecan_services, test_service_id_one_next_to_the_allocation_message)
 	dronecan_get_stats(dc, &s);
 	zassert_equal(s.alloc_rx, 0, "the request reached the allocation handler");
 }
+
+// A handler that answers later: it keeps a copy of the request and returns
+// DRONECAN_SERVICE_DEFERRED
+static struct dronecan_transfer kept;
+static K_SEM_DEFINE(kept_sem, 0, 1);
+
+static int defer_cb(const struct device *dev,
+		    const struct dronecan_transfer *req,
+		    void *response,
+		    uint16_t response_size,
+		    void *user_data)
+{
+	kept = *req;
+	k_sem_give(&kept_sem);
+	return DRONECAN_SERVICE_DEFERRED;
+}
+
+ZTEST(dronecan_services, test_deferred_response)
+{
+	const uint8_t p[1] = {1};
+	const uint8_t answer[3] = {7, 8, 9};
+	struct dronecan_stats s;
+
+	k_sem_reset(&kept_sem);
+	zassert_ok(dronecan_register_service(dc, &svc, &echo_desc, defer_cb, NULL));
+	memset(&resp, 0, sizeof(resp));
+	resp_count = 0;
+	client_send(42, echo_desc.signature, echo_desc.id, p, sizeof(p));
+	zassert_ok(k_sem_take(&kept_sem, K_MSEC(500)));
+
+	// Nothing is sent until the handler answers
+	zassert_false(client_wait(K_MSEC(200)), "a deferred request was answered by itself");
+	dronecan_get_stats(dc, &s);
+	zassert_equal(s.svc_errors, 0, "deferring is not an error");
+	zassert_equal(s.svc_responses, 0);
+
+	zassert_ok(dronecan_service_respond(dc, &kept, answer, sizeof(answer)));
+	zassert_true(client_wait(K_MSEC(500)));
+	zassert_equal(resp.len, sizeof(answer));
+	zassert_mem_equal(resp.data, answer, sizeof(answer));
+	zassert_equal(resp.source, 42);
+	zassert_equal(resp.transfer_id, last_request_tid, "the answer carries the request's ID");
+	zassert_equal(resp.priority, CANARD_TRANSFER_PRIORITY_MEDIUM);
+	dronecan_get_stats(dc, &s);
+	zassert_equal(s.svc_requests, 1);
+	zassert_equal(s.svc_responses, 1);
+}
+
+// The node answers other requests while one is deferred, and the deferred one still gets its
+// answer
+ZTEST(dronecan_services, test_other_requests_are_answered_while_one_is_deferred)
+{
+	const uint8_t p[1] = {1};
+	const uint8_t q[2] = {5, 6};
+	const uint8_t answer[1] = {9};
+
+	k_sem_reset(&kept_sem);
+	zassert_ok(dronecan_register_service(dc, &svc, &echo_desc, defer_cb, NULL));
+	zassert_ok(dronecan_register_service(dc, &svc2, &echo1_desc, echo_cb, NULL));
+	client_send(42, echo_desc.signature, echo_desc.id, p, sizeof(p));
+	zassert_ok(k_sem_take(&kept_sem, K_MSEC(500)));
+	zassert_true(request_id(42, echo1_desc.id, echo1_desc.signature, q, sizeof(q), K_MSEC(500)));
+	zassert_mem_equal(resp.data, q, sizeof(q));
+	memset(&resp, 0, sizeof(resp));
+	zassert_ok(dronecan_service_respond(dc, &kept, answer, sizeof(answer)));
+	zassert_true(client_wait(K_MSEC(500)));
+	zassert_equal(resp.len, sizeof(answer));
+	zassert_equal(resp.data[0], answer[0]);
+}
+
+static const uint8_t late_answer[2] = {3, 4};
+
+static void late_answer_fn(struct k_work *work)
+{
+	dronecan_service_respond(dc, &kept, late_answer, sizeof(late_answer));
+}
+
+static K_WORK_DELAYABLE_DEFINE(late_work, late_answer_fn);
+
+ZTEST(dronecan_services, test_deferred_answer_from_another_thread)
+{
+	const uint8_t p[1] = {1};
+
+	k_sem_reset(&kept_sem);
+	zassert_ok(dronecan_register_service(dc, &svc, &echo_desc, defer_cb, NULL));
+	memset(&resp, 0, sizeof(resp));
+	client_send(42, echo_desc.signature, echo_desc.id, p, sizeof(p));
+	zassert_ok(k_sem_take(&kept_sem, K_MSEC(500)));
+
+	// The system work queue answers 100 ms later, the RX thread is free meanwhile
+	k_work_schedule(&late_work, K_MSEC(100));
+
+	zassert_true(client_wait(K_MSEC(1000)));
+	zassert_mem_equal(resp.data, late_answer, sizeof(late_answer));
+}
+
+ZTEST(dronecan_services, test_respond_after_unregister_is_refused)
+{
+	const uint8_t p[1] = {1};
+	const uint8_t answer[1] = {1};
+
+	k_sem_reset(&kept_sem);
+	zassert_ok(dronecan_register_service(dc, &svc, &echo_desc, defer_cb, NULL));
+	client_send(42, echo_desc.signature, echo_desc.id, p, sizeof(p));
+	zassert_ok(k_sem_take(&kept_sem, K_MSEC(500)));
+
+	zassert_ok(dronecan_unregister_service(dc, &svc));
+	zassert_equal(dronecan_service_respond(dc, &kept, answer, sizeof(answer)), -ENOENT);
+	memset(&resp, 0, sizeof(resp));
+	zassert_false(client_wait(K_MSEC(200)));
+}
+
+ZTEST(dronecan_services, test_respond_when_stopped_is_refused)
+{
+	const uint8_t p[1] = {1};
+	const uint8_t answer[1] = {1};
+
+	k_sem_reset(&kept_sem);
+	zassert_ok(dronecan_register_service(dc, &svc, &echo_desc, defer_cb, NULL));
+	client_send(42, echo_desc.signature, echo_desc.id, p, sizeof(p));
+	zassert_ok(k_sem_take(&kept_sem, K_MSEC(500)));
+
+	can_remove_rx_filter(can, filter_id);
+	zassert_ok(dronecan_stop(dc));
+	zassert_equal(dronecan_service_respond(dc, &kept, answer, sizeof(answer)), -ENOTCONN);
+	zassert_ok(dronecan_start(dc)); // after() stops it and removes the filter again
+	static const struct can_filter all = {.id = 0, .mask = 0, .flags = CAN_FILTER_IDE};
+
+	filter_id = can_add_rx_filter_msgq(can, &client_msgq, &all);
+	zassert_true(filter_id >= 0);
+}
+
+ZTEST(dronecan_services, test_respond_arguments)
+{
+	const uint8_t p[1] = {1};
+	uint8_t big[CONFIG_DRONECAN_MAX_SERVICE_RESPONSE + 1] = {0};
+
+	k_sem_reset(&kept_sem);
+	zassert_ok(dronecan_register_service(dc, &svc, &echo_desc, defer_cb, NULL));
+	client_send(42, echo_desc.signature, echo_desc.id, p, sizeof(p));
+	zassert_ok(k_sem_take(&kept_sem, K_MSEC(500)));
+
+	zassert_equal(dronecan_service_respond(dc, NULL, p, sizeof(p)), -EINVAL);
+	zassert_equal(dronecan_service_respond(dc, &kept, NULL, 1), -EINVAL);
+	zassert_equal(dronecan_service_respond(dc, &kept, big, sizeof(big)), -EMSGSIZE);
+
+	// An empty answer is valid, like for a handler that returns 0
+	zassert_ok(dronecan_service_respond(dc, &kept, NULL, 0));
+}
